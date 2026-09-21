@@ -1,0 +1,28 @@
+{
+  "pages": [
+    {
+      "path": "pages/index/index",
+      "style": {
+        "navigationBarTitleText": "① 扫描·连接·绑定"
+      }
+    },
+    {
+      "path": "pages/rke/rke",
+      "style": {
+        "navigationBarTitleText": "② 上锁 / 解锁"
+      }
+    },
+    {
+      "path": "pages/debug/debug",
+      "style": {
+        "navigationBarTitleText": "③ 报文控制台"
+      }
+    }
+  ],
+  "globalStyle": {
+    "navigationBarTextStyle": "black",
+    "navigationBarTitleText": "Tesla BLE 离线钥匙探针",
+    "navigationBarBackgroundColor": "#F2F2F2",
+    "backgroundColor": "#F8F8F8"
+  }
+}

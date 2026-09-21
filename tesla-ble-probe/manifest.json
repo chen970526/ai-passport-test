@@ -1,0 +1,79 @@
+{
+    "name" : "tesla-ble-probe",
+    "appid" : "__UNI__4D4E055",
+    "description" : "特斯拉 BLE 离线钥匙（VCSEC）可行性探针：绑定 + 上锁 + 解锁",
+    "versionName" : "0.1.2",
+    "versionCode" : "3",
+    "transformPx" : false,
+    /* 5+App特有相关 */
+    "app-plus" : {
+        "usingComponents" : true,
+        "nvueStyleCompiler" : "uni-app",
+        "compilerVersion" : 3,
+        "splashscreen" : {
+            "alwaysShowBeforeRender" : true,
+            "waiting" : true,
+            "autoclose" : true,
+            "delay" : 0
+        },
+        /* uni.openBluetoothAdapter 依赖 5+ 的 Bluetooth 模块。
+           缺它会在运行时弹「打包时未添加bluetooth模块」并中止。
+           注意：本文件被 HBuilderX 可视化界面（App模块配置）持有内存模型，
+           在界面里保存/打包会把这里手写的 modules 覆盖掉。
+           改完必须确认「App模块配置 → 蓝牙(Bluetooth)」显示为已勾选。 */
+        "modules" : {
+            "Bluetooth" : {}
+        },
+        "distribute" : {
+            "android" : {
+                /* 只有「模块 + 权限 + abiFilters + targetSdk」编译进基座，必须一次打对；
+                   其余（运行时申请哪几个权限、报文逻辑、页面）都是 JS，热更新即可。 */
+                "permissions" : [
+                    "<uses-permission android:name=\"android.permission.BLUETOOTH\"/>",
+                    "<uses-permission android:name=\"android.permission.BLUETOOTH_ADMIN\"/>",
+                    "<uses-permission android:name=\"android.permission.BLUETOOTH_SCAN\"/>",
+                    "<uses-permission android:name=\"android.permission.BLUETOOTH_CONNECT\"/>",
+                    "<uses-permission android:name=\"android.permission.BLUETOOTH_ADVERTISE\"/>",
+                    "<uses-permission android:name=\"android.permission.ACCESS_FINE_LOCATION\"/>",
+                    "<uses-permission android:name=\"android.permission.ACCESS_COARSE_LOCATION\"/>",
+                    "<uses-permission android:name=\"android.permission.ACCESS_NETWORK_STATE\"/>",
+                    "<uses-permission android:name=\"android.permission.ACCESS_WIFI_STATE\"/>",
+                    "<uses-permission android:name=\"android.permission.VIBRATE\"/>",
+                    /* 车库实测三件套：绑定要等 60 秒刷钥匙卡，锁屏/休眠/省电杀后台会让整轮作废 */
+                    "<uses-permission android:name=\"android.permission.WAKE_LOCK\"/>",
+                    "<uses-permission android:name=\"android.permission.FOREGROUND_SERVICE\"/>",
+                    "<uses-permission android:name=\"android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE\"/>",
+                    "<uses-permission android:name=\"android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS\"/>"
+                ],
+                "permissionExternalStorage" : {
+                    "request" : "none"
+                },
+                "abiFilters" : [ "armeabi-v7a", "arm64-v8a" ],
+                "minSdkVersion" : 21,
+                "targetSdkVersion" : 30
+            },
+            "ios" : {
+                "idfa" : false,
+                "urltype" : "",
+                "urlschemewhitelist" : "",
+                "UIBackgroundModes" : [ "bluetooth-central" ],
+                "NSBluetoothAlwaysUsageDescription" : "用于连接特斯拉车辆进行离线钥匙功能验证",
+                "NSBluetoothPeripheralUsageDescription" : "用于连接特斯拉车辆进行离线钥匙功能验证",
+                "dSYMs" : false
+            },
+            "sdkConfigs" : {}
+        }
+    },
+    "quickapp" : {},
+    "mp-weixin" : {
+        "appid" : "",
+        "setting" : {
+            "urlCheck" : false
+        },
+        "usingComponents" : true
+    },
+    "h5" : {
+        "title" : "Tesla BLE 探针（H5 不支持蓝牙）"
+    },
+    "vueVersion" : "3"
+}

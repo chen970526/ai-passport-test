@@ -1,0 +1,13 @@
+# 本地压缩包与临时测试产物
+ai-passport.zip
+.hosttest/
+
+# 构建产物（ai-passport/.gitignore 与 tesla-ble-probe/.gitignore 已覆盖各自目录，此处兜底）
+build/
+managed_components/
+sdkconfig
+sdkconfig.old
+unpackage/
+node_modules/
+*.o
+*.log
