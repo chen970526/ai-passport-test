@@ -4,13 +4,10 @@
       <view class="title">会话</view>
       <view class="status">{{ status }}</view>
       <view class="row">
-        <button class="btn btn-plain" size="mini" :loading="busy === 1" @click="doEph">协商临时公钥</button>
+        <button class="btn btn-plain" size="mini" :loading="busy === 1" @click="doEph">重新握手（临时公钥）</button>
         <button class="btn btn-plain" size="mini" :loading="busy === 2" @click="doStatus">查车辆状态</button>
       </view>
-      <view class="tip">
-        解锁 / 上锁第一次点击时会自动先协商临时公钥；每次操作 counter 都会 +1 并落盘，
-        绝不能回退，否则车辆报 IV_SMALLER_THAN_EXPECTED，这把钥匙就得重新绑定。
-      </view>
+      <view class="tip">{{ sessionTip }}</view>
     </view>
 
     <view class="card">
@@ -18,10 +15,10 @@
       <view class="row">
         <button class="btn" size="mini" :loading="busy === 11" @click="doAction(0, 'UNLOCK', 11)">解锁 (0)</button>
         <button class="btn" size="mini" :loading="busy === 12" @click="doAction(1, 'LOCK', 12)">上锁 (1)</button>
-        <button class="btn btn-plain" size="mini" :loading="busy === 13" @click="doAction(2, 'OPEN_TRUNK', 13)">后备箱 (2)</button>
-        <button class="btn btn-plain" size="mini" :loading="busy === 14" @click="doAction(3, 'OPEN_FRUNK', 14)">前备箱 (3)</button>
-        <button class="btn btn-plain" size="mini" :loading="busy === 15" @click="doAction(4, 'OPEN_CHARGE_PORT', 15)">开充电口 (4)</button>
-        <button class="btn btn-plain" size="mini" :loading="busy === 16" @click="doAction(5, 'CLOSE_CHARGE_PORT', 16)">关充电口 (5)</button>
+        <button class="btn btn-plain" size="mini" :loading="busy === 13" @click="doClosure('rearTrunk', 'OPEN_TRUNK', 13)">后备箱 (2)</button>
+        <button class="btn btn-plain" size="mini" :loading="busy === 14" @click="doClosure('frontTrunk', 'OPEN_FRUNK', 14)">前备箱 (3)</button>
+        <button class="btn btn-plain" size="mini" :loading="busy === 15" @click="doClosure('chargePort', 'OPEN_CHARGE_PORT', 15)">开充电口 (4)</button>
+        <button class="btn btn-plain" size="mini" :loading="busy === 16" @click="doClosure('chargePort', 'CLOSE_CHARGE_PORT', 16, false)">关充电口 (5)</button>
       </view>
       <view class="field">
         <text class="field-label">自定义</text>
@@ -30,10 +27,7 @@
       <view class="row">
         <button class="btn btn-plain" size="mini" :loading="busy === 9" @click="doCustom">发送自定义动作</button>
       </view>
-      <view class="tip">
-        本表只登记 v3.10.14 里确认存在的 0..20；AUTO_SECURE_VEHICLE / WAKE_VEHICLE 之类新动作
-        数值未经核实，发出去最多拿到 FAULT_UNKNOWN，不会伤车，但别把它当成方案不行的证据。
-      </view>
+      <view class="tip">{{ actionTip }}</view>
     </view>
 
     <view class="card">
@@ -41,7 +35,7 @@
       <view class="row">
         <button class="btn btn-plain" size="mini" :loading="busy === 10" @click="doLoop">上锁→解锁 各 3 次</button>
       </view>
-      <view class="tip">用来验证 counter 单调递增与共享密钥复用是否符合预期（同一 sharedKey 换 counter 连发）。</view>
+      <view class="tip">用来验证会话复用与 counter 单调递增是否符合预期（同一 sharedKey 连续换 counter 发帧）。</view>
     </view>
 
     <view class="card">
@@ -53,12 +47,22 @@
 
 <script>
 import { log } from '@/common/session.js'
-import { sendRke, requestEphemeralKey, queries, statusText, RKE } from '@/common/actions.js'
-import { label } from '@/common/vcsec.js'
+import { sendRke, sendClosure, requestEphemeralKey, queries, statusText, label, rkeEnum, closureEnum } from '@/common/api.js'
+import { notify } from '@/common/notify.js'
 
 export default {
   data() {
     return { status: '', busy: 0, custom: '' }
+  },
+  computed: {
+    sessionTip() {
+      return '每次动作前会自动握手（拿 epoch / clock_time），会话失效时点上面这个按钮强制重来一次；' +
+        '握手被车端拒绝（比如钥匙不在白名单）时不会白跑三次，日志里会直接说是哪个 status。'
+    },
+    actionTip() {
+      return 'V3 的 RKEAction_E 只剩 0/1/20/29/30；后备箱、前备箱、充电口走 ClosureMoveRequest，' +
+        '所以上面这几个按钮发的是闭锁器报文，编号只是沿用旧版的叫法。'
+    }
   },
   onShow() {
     this.tick()
@@ -74,8 +78,9 @@ export default {
     tick() {
       this.status = statusText()
     },
+    // 统一走可复制弹窗（见 common/notify.js），正文一律不许截断
     toast(t) {
-      if (typeof uni !== 'undefined' && uni.showToast) uni.showToast({ title: t, icon: 'none', duration: 2500 })
+      notify(t)
     },
     async guard(n, fn) {
       if (this.busy) {
@@ -86,8 +91,10 @@ export default {
       try {
         await fn()
       } catch (e) {
-        log('error', (e && e.message) || String(e))
-        this.toast('失败，看日志')
+        // 弹窗里直接带错误原文（点「复制」取全文），不要只说「看日志」
+        const msg = ((e && (e.message || e.errMsg)) || String(e)) + (e && e.errCode !== undefined ? ' errCode=' + e.errCode : '')
+        log('error', '未捕获错误: ' + msg)
+        this.toast('失败：' + msg)
       } finally {
         this.busy = 0
         this.tick()
@@ -97,7 +104,7 @@ export default {
       return this.guard(1, async () => {
         const r = await requestEphemeralKey()
         log(r.ok ? 'ok' : 'warn', r.text)
-        this.toast(r.text.slice(0, 60))
+        this.toast(r.text)
       })
     },
     doStatus() {
@@ -111,7 +118,18 @@ export default {
       return this.guard(n, async () => {
         const r = await sendRke(action, name)
         log(r.ok ? 'ok' : 'warn', r.text)
-        this.toast(r.text.slice(0, 60))
+        this.toast(r.text)
+      })
+    },
+    // 后备箱 / 前备箱 / 充电口在 V3 里走 ClosureMoveRequest
+    doClosure(field, name, n, open) {
+      return this.guard(n, async () => {
+        const type = closureEnum(open === false ? 'CLOSURE_MOVE_TYPE_CLOSE' : 'CLOSURE_MOVE_TYPE_OPEN')
+        const req = {}
+        req[field] = type
+        const r = await sendClosure(req, name)
+        log(r.ok ? 'ok' : 'warn', r.text)
+        this.toast(r.text)
       })
     },
     doCustom() {
@@ -123,15 +141,17 @@ export default {
       return this.guard(9, async () => {
         const r = await sendRke(v, 'CUSTOM_' + v + '_' + label('RKEAction_E', v))
         log(r.ok ? 'ok' : 'warn', r.text)
-        this.toast(r.text.slice(0, 60))
+        this.toast(r.text)
       })
     },
     async doLoop() {
       await this.guard(10, async () => {
+        const lock = rkeEnum('RKE_ACTION_LOCK')
+        const unlock = rkeEnum('RKE_ACTION_UNLOCK')
         for (let i = 0; i < 3; i++) {
-          const a = await sendRke(RKE.RKE_ACTION_LOCK, 'LOOP_LOCK#' + (i + 1))
+          const a = await sendRke(lock, 'LOOP_LOCK#' + (i + 1))
           log(a.ok ? 'ok' : 'warn', a.text)
-          const b = await sendRke(RKE.RKE_ACTION_UNLOCK, 'LOOP_UNLOCK#' + (i + 1))
+          const b = await sendRke(unlock, 'LOOP_UNLOCK#' + (i + 1))
           log(b.ok ? 'ok' : 'warn', b.text)
           if (!a.ok || !b.ok) {
             log('error', '压测在第 ' + (i + 1) + ' 轮中断，后续结果不再可信')

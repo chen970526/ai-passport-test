@@ -58,6 +58,34 @@ function hasTeslaService(d) {
   return false;
 }
 
+// 广播名匹配器：精确 / 前缀之外再兜一层「只留字母数字并转大写」的宽松比较
+// （不同固件、系统对分隔符和大小写不一致：Tesla 723591 / Tesla_723591 / tesla723591）
+// 命中返回 { matched, mode }，没命中返回 null。
+export function makeMatcher(names) {
+  const exact = (names && names.exact) || [];
+  const prefixes = (names && names.prefixes) || [];
+  const exactN = exact.map(normName);
+  const prefixN = prefixes.map(normName);
+  return (n) => {
+    const s = String(n || '');
+    for (const e of exact) if (s === e) return { matched: e, mode: 'exact' };
+    for (const p of prefixes) if (p && s.indexOf(p) === 0) return { matched: p, mode: 'prefix' };
+    const nn = normName(s);
+    for (const e of exactN) if (nn === e) return { matched: e, mode: 'loose' };
+    for (const p of prefixN) if (p && nn.indexOf(p) === 0) return { matched: p, mode: 'loose-prefix' };
+    return null;
+  };
+}
+
+// 手选列表的排序：命中 VIN → 广播了 0211 → 有名字 → 无名，同级按信号强弱（RSSI 越接近 0 越强）
+export function sortAdv(list) {
+  const rank = (e) => (e.hit ? 0 : e.tesla ? 1 : e.name ? 2 : 3);
+  const r = (e) => (typeof e.rssi === 'number' && e.rssi ? e.rssi : -999);
+  return (list || []).slice().sort(
+    (a, b) => rank(a) - rank(b) || r(b) - r(a) || String(a.name || '').localeCompare(String(b.name || ''))
+  );
+}
+
 // uni 的 API 在有回调时不返回 Promise，这里统一包一层，顺便处理「环境没有该能力」
 function api(name, opts) {
   return new Promise((resolve, reject) => {
@@ -170,6 +198,10 @@ export class TeslaBle {
     this._rx = new Uint8Array(0);
     this._tx = Promise.resolve();
     this._waiters = [];
+    // V3 的 readUntil 语义：车辆会连发多帧 ACK。只有在 receive() 之后才暂存无人等待的帧，
+    // send() 会清空，旧版「一问一答」行为完全不变。
+    this._queue = [];
+    this._buffering = false;
     this._listening = false;
   }
 
@@ -200,18 +232,7 @@ export class TeslaBle {
     const limit = timeoutMs || 15000;
     const exact = (names && names.exact) || [];
     const prefixes = (names && names.prefixes) || [];
-    // 不同固件/系统对分隔符和大小写不一致（Tesla 723591 / Tesla_723591 / tesla723591），
-    // 精确与前缀之外再兜一层「只留字母数字并转大写」的宽松比较。
-    const exactN = exact.map(normName);
-    const prefixN = prefixes.map(normName);
-    const hit = (n) => {
-      for (const e of exact) if (n === e) return { name: n, matched: e, mode: 'exact' };
-      for (const p of prefixes) if (n.indexOf(p) === 0) return { name: n, matched: p, mode: 'prefix' };
-      const nn = normName(n);
-      for (const e of exactN) if (nn === e) return { name: n, matched: e, mode: 'loose' };
-      for (const p of prefixN) if (p && nn.indexOf(p) === 0) return { name: n, matched: p, mode: 'loose-prefix' };
-      return null;
-    };
+    const hit = makeMatcher(names);
     const seen = [];
     return new Promise((resolve, reject) => {
       let done = false;
@@ -302,6 +323,67 @@ export class TeslaBle {
     });
     await api('stopBluetoothDevicesDiscovery', { allowDuplicatesKey: false }).catch(() => {});
     return Object.keys(found).sort().map((n) => ({ name: n, deviceId: found[n] }));
+  }
+
+  // 扫描并把看到的广播实时交给 onFound，超时后返回排好序的全量列表。
+  // 和 scan() 的区别：不做「命中即停」，而是全部列出来让人手选 ——
+  // 车辆蓝牙名被系统改过（或在系统里已配对、名字被缓存）时，按 VIN 算出来的名字根本匹配不上，只能手选。
+  discover(timeoutMs, names, onFound) {
+    const limit = timeoutMs || 12000;
+    const match = makeMatcher(names);
+    const found = new Map(); // deviceId -> { deviceId, name, rssi, tesla, hit, mode }
+    return new Promise((resolve, reject) => {
+      if (typeof uni === 'undefined' || typeof uni.onBluetoothDeviceFound !== 'function') {
+        reject(new Error('当前运行环境没有蓝牙扫描能力'));
+        return;
+      }
+      const snapshot = () => {
+        const list = sortAdv(Array.from(found.values()));
+        if (typeof onFound === 'function') {
+          try { onFound(list); } catch (e) { /* 页面已卸载 */ }
+        }
+        return list;
+      };
+      const cb = (res) => {
+        for (const d of res.devices || []) {
+          if (!d || !d.deviceId) continue;
+          const old = found.get(d.deviceId) || {};
+          const n = d.name || d.localName || old.name || '';
+          const m = n ? match(n) : null;
+          found.set(d.deviceId, {
+            deviceId: d.deviceId,
+            name: n,
+            rssi: typeof d.RSSI === 'number' ? d.RSSI : old.rssi,
+            tesla: hasTeslaService(d) || !!old.tesla,
+            hit: m ? m.matched : old.hit || null,
+            mode: m ? m.mode : old.mode || ''
+          });
+        }
+        snapshot();
+      };
+      let finished = false;
+      const finish = () => {
+        if (finished) return;
+        finished = true;
+        try { uni.offBluetoothDeviceFound(); } catch (e) { /* 老版本无此 API */ }
+        api('stopBluetoothDevicesDiscovery', { allowDuplicatesKey: false }).catch(() => {});
+        this.setState('idle');
+        resolve(snapshot());
+      };
+      uni.onBluetoothDeviceFound(cb);
+      api('startBluetoothDevicesDiscovery', { allowDuplicatesKey: false, powerLevel: 'high', interval: 0 })
+        .then(() => {
+          this.log('info', '扫描中（' + limit + 'ms，全部列出手选）');
+          this.setState('scanning');
+          setTimeout(finish, limit);
+        })
+        .catch((e) => {
+          if (finished) return;
+          finished = true;
+          try { uni.offBluetoothDeviceFound(); } catch (e2) { /* 忽略 */ }
+          reject(e);
+        });
+    });
   }
 
   // ---------------------------------------------------------- 连接与订阅
@@ -434,9 +516,16 @@ export class TeslaBle {
     if (w) {
       clearTimeout(w.timer);
       w.resolve(body);
-    } else {
-      this.log('info', '无人等待的响应（车辆主动上报？）' + toHex(body));
+      return;
     }
+    if (this._buffering) {
+      // 我们还在处理上一帧，车辆又推了一帧过来：先存着，别丢
+      if (this._queue.length >= 8) this._queue.shift();
+      this._queue.push(body);
+      this.log('info', '暂存车辆推送（队列 ' + this._queue.length + ' 帧）' + toHex(body));
+      return;
+    }
+    this.log('info', '无人等待的响应（车辆主动上报？）' + toHex(body));
   }
 
   _rejectAll(err) {
@@ -446,21 +535,41 @@ export class TeslaBle {
       w.reject(err);
     }
     this._rx = new Uint8Array(0);
+    this._queue.length = 0;
   }
 
   // ---------------------------------------------------------- 收发
 
   // 发一帧（自动排队），等待一个完整响应帧；timeout=0 表示不等响应
-  async send(frame, timeoutMs) {
+  // keepQueue=true：不清空暂存队列。V3 的 readUntil 循环「收一帧 → 处理 → receive 下一帧」
+  // 期间车辆可能又推了 ACK 进来，清空会把它们丢掉。旧版一问一答不传这个参数，行为不变。
+  async send(frame, timeoutMs, keepQueue) {
     if (!this.connected) throw new Error('尚未连接车辆');
     const wait = timeoutMs === undefined ? 8000 : timeoutMs;
     this._rx = new Uint8Array(0); // 丢弃上次残留，保证一问一答对齐
+    this._buffering = false;
+    if (!keepQueue) this._queue.length = 0;
     const p = wait > 0 ? this._waitForFrame(wait) : null;
     // 规则 B：串行写
-    this._tx = this._tx.then(() => this._writeChunked(frame)).catch(() => {});
+    let writeError = null;
+    this._tx = this._tx
+      .then(() => this._writeChunked(frame))
+      .catch((e) => {
+        writeError = e; // 不许吞：以前 .catch(() => {}) 会把真实写失败抹掉，只剩一个误导人的「响应超时」
+      });
     await this._tx;
     this.onRaw('tx', frame);
     this.log('tx', '发送 ' + frame.length + ' 字节: ' + toHex(frame));
+    if (writeError) {
+      const t = errText(writeError);
+      this.log('error', 'BLE 写失败：' + t + '（帧 ' + frame.length + ' 字节 / MTU=' + this.mtu + ' / 特征 ' + (this.writeId || '?') + '）');
+      // 撤销刚登记的响应等待，避免半写状态下留下悬着的超时定时器
+      if (p) {
+        p.catch(() => {}); // 下面 _rejectAll 会拒绝它，但没人 await，标记为已处理
+        this._rejectAll(new Error('BLE 写失败：' + t));
+      }
+      throw new Error('BLE 写失败：' + t);
+    }
     if (!p) return null;
     const body = await p;
     this.log('rx', '响应 ' + body.length + ' 字节: ' + toHex(body));
@@ -479,19 +588,52 @@ export class TeslaBle {
     });
   }
 
-  // 单帧超过 ATT 可用长度时：特斯拉不接受分包写，只能报出来让人去查 MTU
+  // 不发送，只等车辆下一帧（V3 白名单/RKE 操作会连发多个 ACK，官方用 readUntil 循环收）。
+  // 超时返回 null，不抛错；开启暂存后，处理上一帧期间到达的帧也不会丢。
+  async receive(timeoutMs) {
+    if (!this.connected) throw new Error('尚未连接车辆');
+    this._buffering = true;
+    if (this._queue.length) {
+      const body = this._queue.shift();
+      this.log('rx', '取暂存帧 ' + body.length + ' 字节: ' + toHex(body));
+      return body;
+    }
+    try {
+      const body = await this._waitForFrame(timeoutMs === undefined ? 3000 : timeoutMs);
+      this.log('rx', '续收 ' + body.length + ' 字节: ' + toHex(body));
+      return body;
+    } catch (e) {
+      this.log('info', errText(e));
+      return null;
+    }
+  }
+
+  // 官方 connector/ble/ble.go 的做法：整包前面已经加了 2 字节大端长度前缀，
+  // 再按 blockLength = min(ExchangeMTU, 1024) - 3 循环 WriteCharacteristic 分片，
+  // 车端靠长度前缀重新组包。所以「分包写」不但被接受，而且是官方唯一的写法。
+  // 早期注释说「特斯拉不接受分包写」是错的，这里改成和官方一致的真分包。
   async _writeChunked(frame) {
     const cap = Math.max(20, this.mtu - 3);
     if (frame.length > cap) {
-      this.log('warn', '帧长 ' + frame.length + ' > 当前 MTU 可用 ' + cap + '，尝试直发（多数栈会拒绝）');
+      this.log('info', '帧长 ' + frame.length + ' > MTU 可用 ' + cap + '，按官方规则分成 ' +
+        Math.ceil(frame.length / cap) + ' 片写');
     }
-    await api('writeBLECharacteristicValue', {
-      deviceId: this.deviceId,
-      serviceId: this.serviceId,
-      characteristicId: this.writeId,
-      value: bytesToAb(frame)
-    });
-    await delay(30); // 给车机一点处理时间，避免连写丢包
+    let idx = 0;
+    for (let off = 0; off < frame.length; off += cap) {
+      const size = Math.min(cap, frame.length - off);
+      try {
+        await api('writeBLECharacteristicValue', {
+          deviceId: this.deviceId,
+          serviceId: this.serviceId,
+          characteristicId: this.writeId,
+          value: bytesToAb(frame.subarray(off, off + size))
+        });
+      } catch (e) {
+        throw new Error('第 ' + (idx + 1) + '/' + Math.ceil(frame.length / cap) + ' 片（' + size + ' 字节，偏移 ' + off + '）写入失败：' + errText(e));
+      }
+      idx++;
+      await delay(20); // 给车机一点处理时间，避免连写丢包
+    }
   }
 
   async readVersion() {

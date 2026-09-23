@@ -1,13 +1,13 @@
 // 极简 protobuf wire 编解码（proto3 子集，纯 JS，无依赖、无 BigInt）
 //
-// 只覆盖 Tesla VCSEC 报文用到的类型：
-//   varint(int/enum/bool) / bytes / string / 嵌套 message / repeated（标量按 proto3 默认 packed）
+// 只覆盖 Tesla VCSEC / V3 RoutableMessage 报文用到的类型：
+//   varint(int/enum/bool) / fixed32 / bytes / string / 嵌套 message / repeated（标量按 proto3 默认 packed）
 // 数值只支持到 2^53 以内（VCSEC 报文里最大的字段是 uint32 counter，够用）。
 //
-// spec 结构由调用方注入（见 common/spec.js），本文件不依赖任何 Tesla 专有定义：
+// spec 结构由调用方注入（见 common/v3spec.js），本文件不依赖任何 Tesla 专有定义：
 //   { messages: { <MsgName>: [ {name,num,kind,msg?,enum?,rep?}, ... ] },
 //     enums:    { <EnumName>: { <LABEL>: <value>, ... } } }
-//   kind: 'int' | 'enum' | 'bool' | 'bytes' | 'string' | 'msg'
+//   kind: 'int' | 'enum' | 'bool' | 'fixed32' | 'bytes' | 'string' | 'msg'
 //
 // 编码遵循 proto3 语义：等于默认值（0 / 空 / false）的 singular 标量字段会被省略。
 // 这一点对 Tesla 至关重要：RKE_ACTION_UNLOCK = 0，省略后整个 UnsignedMessage 就是空串，
@@ -124,6 +124,15 @@ export function encode(spec, msgName, obj) {
         if (value === '') continue;
         pushLenField(out, f.num, utf8ToBytes(String(value)));
         break;
+      case 'fixed32': {
+        const n = Number(value);
+        if (!isFinite(n) || n < 0) throw new Error('pb: 字段 ' + msgName + '.' + name + ' 需要非负 uint32');
+        if (n === 0) continue; // proto3: 默认值省略
+        pushTag(out, f.num, WIRE_FIXED32);
+        // protobuf fixed32 是小端 4 字节（例：clock_time=2650 -> 5a0a0000）
+        out.push(n & 0xff, Math.floor(n / 0x100) & 0xff, Math.floor(n / 0x10000) & 0xff, Math.floor(n / 0x1000000) & 0xff);
+        break;
+      }
       case 'int':
       case 'enum':
       case 'bool': {
@@ -171,6 +180,11 @@ function decodeRaw(bytes) {
     }
   }
   return list;
+}
+
+// protobuf fixed32 是小端
+function le32(bytes) {
+  return bytes[0] + bytes[1] * 0x100 + bytes[2] * 0x10000 + bytes[3] * 0x1000000;
 }
 
 function bytesToUtf8Safe(bytes) {
@@ -225,6 +239,9 @@ function mapFields(spec, msgName, raw) {
         break;
       case 'bool':
         obj[f.name] = r.value !== 0;
+        break;
+      case 'fixed32':
+        obj[f.name] = r.wire === WIRE_FIXED32 ? le32(asBytes(r.value, f.name)) : r.value;
         break;
       default:
         obj[f.name] = r.value;

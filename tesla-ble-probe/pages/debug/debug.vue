@@ -12,7 +12,7 @@
     </view>
 
     <view class="card">
-      <view class="title">手工组包（JSON = ToVCSECMessage，bytes 字段可直接写 hex 字符串）</view>
+      <view class="title">手工组包（V3 · JSON = {{ rootName }}，bytes 字段可直接写 hex 字符串）</view>
       <textarea class="ta" v-model="json" :style="{ height: taH }" auto-height="false" />
       <view class="row">
         <button class="btn btn-plain" size="mini" @click="preset('bind')">绑定样例</button>
@@ -63,46 +63,58 @@
 </template>
 
 <script>
-import { log, state, ble, connection } from '@/common/session.js'
-import { SPEC, encode, decode, inspect, prependLength, toHex, label } from '@/common/vcsec.js'
-import { fromHex } from '@/common/bytes.js'
+import { log, state, ble, connection, beginAction, endAction } from '@/common/session.js'
+import { toolkit } from '@/common/api.js'
+import { fromHex, toHex } from '@/common/bytes.js'
 
-const PRESETS = {
-  bind: {
-    signedMessage: { signatureType: 2, protobufMessageAsBytes: '' }
-  },
-  eph: {
-    unsignedMessage: { InformationRequest: { informationRequestType: 3, keyId: { publicKeySHA1: '' } } }
-  },
-  rke: {
-    signedMessage: { signatureType: 0, protobufMessageAsBytes: '', counter: 1, signature: '', keyId: '' }
+// V3：绑定仍是裸 ToVCSECMessage（此时还没有会话），其余是明文 RoutableMessage
+function presets(tk) {
+  const D = tk.SPEC.enums.Domain
+  return {
+    bind: {
+      signedMessage: { signatureType: 2, protobufMessageAsBytes: '' }
+    },
+    eph: {
+      to_destination: { domain: D.DOMAIN_INFOTAINMENT },
+      session_info_request: { public_key: '', challenge: '' },
+      request_uuid: '',
+      uuid: ''
+    },
+    rke: {
+      to_destination: { domain: D.DOMAIN_VEHICLE_SECURITY },
+      protobuf_message_as_bytes: '',
+      flags: 2
+    }
   }
 }
 
 export default {
   data() {
+    const tk = toolkit()
+    const p = presets(tk)
     return {
       raw: [],
-      json: JSON.stringify(PRESETS.eph, null, 1),
+      json: JSON.stringify(p.eph, null, 1),
       hex: '',
       result: '',
       taH: '220rpx',
       busy: 0,
-      msgNames: Object.keys(SPEC.messages),
-      msgName: 'FromVCSECMessage',
-      enumNames: Object.keys(SPEC.enums),
-      enumName: 'SignedMessage_information_E'
+      rootName: 'RoutableMessage',
+      msgNames: Object.keys(tk.SPEC.messages),
+      msgName: 'RoutableMessage',
+      enumNames: Object.keys(tk.SPEC.enums),
+      enumName: 'MessageFault_E'
     }
   },
   computed: {
     msgDump() {
-      const list = SPEC.messages[this.msgName] || []
+      const list = (toolkit().SPEC.messages || {})[this.msgName] || []
       return list
         .map((f) => f.num + ' ' + f.name + ' : ' + f.kind + (f.enum ? '<' + f.enum + '>' : f.msg ? '<' + f.msg + '>' : '') + (f.rep ? ' repeated' : ''))
         .join('\n')
     },
     enumDump() {
-      const map = SPEC.enums[this.enumName] || {}
+      const map = (toolkit().SPEC.enums || {})[this.enumName] || {}
       return Object.keys(map)
         .map((k) => map[k] + ' ' + k)
         .sort((a, b) => parseInt(a, 10) - parseInt(b, 10))
@@ -122,85 +134,102 @@ export default {
     clearInterval(this._timer)
   },
   methods: {
-    toast(t) {
-      if (typeof uni !== 'undefined' && uni.showToast) uni.showToast({ title: t, icon: 'none', duration: 2200 })
-    },
     preset(k) {
-      const p = JSON.parse(JSON.stringify(PRESETS[k]))
+      const tk = toolkit()
+      const p = JSON.parse(JSON.stringify(presets(tk)[k]))
+      this.rootName = k === 'bind' ? 'ToVCSECMessage' : 'RoutableMessage'
       if (!state.publicKey) {
         this.result = '先在①页生成密钥（绑定或查白名单会自动生成），preset 需要真实公钥才能算出内层报文'
         this.json = JSON.stringify(p, null, 1)
         return
       }
-      const P = SPEC.enums.WhitelistKeyPermission_E
-      const F = SPEC.enums.KeyFormFactor
+      const F = tk.SPEC.enums.KeyFormFactor
+      const ROLE = tk.SPEC.enums.Role
       if (k === 'bind') {
-        const inner = encode(SPEC, 'UnsignedMessage', {
+        // 现行 proto 里 permission 数组已被 keyRole 取代
+        const inner = tk.encode(tk.SPEC, 'UnsignedMessage', {
           WhitelistOperation: {
-            addKeyToWhitelistAndAddPermissions: {
-              key: { PublicKeyRaw: toHex(state.publicKey) },
-              permission: [P.WHITELISTKEYPERMISSION_LOCAL_DRIVE, P.WHITELISTKEYPERMISSION_LOCAL_UNLOCK, P.WHITELISTKEYPERMISSION_REMOTE_DRIVE, P.WHITELISTKEYPERMISSION_REMOTE_UNLOCK]
-            },
+            addKeyToWhitelistAndAddPermissions: { key: { PublicKeyRaw: toHex(state.publicKey) }, keyRole: ROLE.ROLE_DRIVER },
             metadataForKey: { keyFormFactor: F.KEY_FORM_FACTOR_ANDROID_DEVICE }
           }
         })
         p.signedMessage.protobufMessageAsBytes = toHex(inner)
-        p.signedMessage.keyId = state.keyId
-        this.result = 'bind 内层 = 未加密的 UnsignedMessage（' + inner.length + 'B）；发出后车辆回 WAIT，刷钥匙卡后回 OK'
+        this.result = 'bind 内层 = 未加密的 UnsignedMessage（' + inner.length + 'B），signatureType=PRESENT_KEY；' +
+          '这条链路官方不等响应，①页的「绑定」按钮发的就是它'
       }
       if (k === 'eph') {
-        p.unsignedMessage.InformationRequest.keyId.publicKeySHA1 = state.keyId
-        this.result = 'eph 走 unsignedMessage（不加密），响应里 sessionInfo.publicKey 是 65 字节未压缩点'
+        p.session_info_request.public_key = toHex(state.publicKey)
+        this.result = 'eph = 握手第一步（session_info_request），明文；车辆的 session_info 要配 session_info_tag 才认'
       }
       if (k === 'rke') {
-        const inner = encode(SPEC, 'UnsignedMessage', { RKEAction: 1 })
-        p.signedMessage.protobufMessageAsBytes = toHex(inner)
-        p.signedMessage.keyId = state.keyId
-        p.signedMessage.counter = state.counter || 1
-        this.result = '注意：这里的密文/明文是手填的，signature 需要你按 sharedKey + counter 自己算 GCM tag，' +
-          '正常发 RKE 请用②页的按钮。本 preset 只用于观察报文结构。'
+        const action = 1 // LOCK
+        const inner = tk.encode(tk.SPEC, 'UnsignedMessage', { RKEAction: action })
+        p.protobuf_message_as_bytes = toHex(inner)
+        this.result = '注意：这里组的是「明文」RoutableMessage，只用于看字段；' +
+          '真发 RKE 请用②页按钮（会自动握手 + AES-GCM 加密 + counter 递增）。'
       }
       this.json = JSON.stringify(p, null, 1)
     },
     buildFromJson() {
+      const tk = toolkit()
       const obj = JSON.parse(this.json)
-      const body = encode(SPEC, 'ToVCSECMessage', obj)
-      return { obj, body, frame: prependLength(body) }
+      const body = tk.encode(tk.SPEC, this.rootName, obj)
+      return { tk, obj, body, frame: tk.prependLength(body) }
     },
     encodeOnly() {
       try {
         const r = this.buildFromJson()
         this.result = 'protobuf ' + r.body.length + 'B: ' + toHex(r.body) + '\n带长度前缀 ' + r.frame.length + 'B: ' + toHex(r.frame) +
-          '\n回读校验:\n' + inspect(SPEC, 'ToVCSECMessage', decode(SPEC, 'ToVCSECMessage', r.body))
+          '\n回读校验:\n' + r.tk.inspect(r.tk.SPEC, this.rootName, r.tk.decode(r.tk.SPEC, this.rootName, r.body))
         log('tx', '手工编码 ' + toHex(r.frame))
       } catch (e) {
         this.result = '失败: ' + ((e && e.message) || e)
         log('error', '手工编码失败: ' + ((e && e.message) || e))
       }
     },
+    // 响应解读：先判断这帧是不是 RoutableMessage，不是就按裸 FromVCSECMessage 解
+    describeResponse(tk, body) {
+      const parsed = tk.parseFrame(body)
+      if (parsed.kind !== 'routable') {
+        const dec = tk.decode(tk.SPEC, 'FromVCSECMessage', parsed.vcsec || body)
+        return '响应（裸 FromVCSECMessage）\n' + tk.inspect(tk.SPEC, 'FromVCSECMessage', dec) + '\n摘要: ' + this.summaryOf(tk, dec)
+      }
+      let out = '响应（RoutableMessage）\n' + tk.inspect(tk.SPEC, 'RoutableMessage', parsed.rm) + '\n摘要: ' + tk.summarize(parsed.rm).text
+      if (parsed.rm.protobuf_message_as_bytes && parsed.rm.protobuf_message_as_bytes.length) {
+        const dec = tk.decode(tk.SPEC, 'FromVCSECMessage', parsed.rm.protobuf_message_as_bytes)
+        out += '\n内层 FromVCSECMessage:\n' + tk.inspect(tk.SPEC, 'FromVCSECMessage', dec)
+      }
+      return out
+    },
     async sendJson() {
       if (this.busy) return
       this.busy = 1
+      beginAction('报文控制台 · 手工组包发送（' + this.rootName + '）')
+      let outcome = ''
       try {
         const r = this.buildFromJson()
-        const body = await ble().send(r.frame, 8000)
+        // 收帧窗口里车辆可能连发多帧，keepQueue=true 才不丢暂存的 ACK
+        const body = await ble().send(r.frame, 8000, true)
         if (!body) {
           this.result = '已发送，不等待响应'
+          outcome = '已发送（无响应）'
           return
         }
-        const dec = decode(SPEC, 'FromVCSECMessage', body)
-        this.result = '响应 ' + toHex(body) + '\n' + inspect(SPEC, 'FromVCSECMessage', dec) + '\n摘要: ' + this.summaryOf(dec)
+        this.result = this.describeResponse(r.tk, body)
+        outcome = '已收到响应'
       } catch (e) {
         this.result = '失败: ' + ((e && e.message) || e)
         log('error', '手工发送失败: ' + ((e && e.message) || e))
+        outcome = '失败：' + ((e && e.message) || e)
       } finally {
+        endAction(outcome)
         this.busy = 0
       }
     },
-    summaryOf(obj) {
+    summaryOf(tk, obj) {
       const cs = obj && obj.commandStatus
       if (!cs) return '(无 commandStatus)'
-      return 'status=' + label('OperationStatus_E', cs.operationStatus)
+      return 'status=' + tk.label('VCOperationStatus_E', cs.operationStatus)
     },
     normalizeHex() {
       const s = this.hex.replace(/[^0-9a-fA-F]/g, '')
@@ -214,9 +243,10 @@ export default {
     },
     pick(msgName) {
       try {
+        const tk = toolkit()
         const bytes = this.normalizeHex()
-        const obj = decode(SPEC, msgName, bytes)
-        this.result = '按 ' + msgName + ' 解析:\n' + inspect(SPEC, msgName, obj)
+        const obj = tk.decode(tk.SPEC, msgName, bytes)
+        this.result = '按 ' + msgName + ' 解析:\n' + tk.inspect(tk.SPEC, msgName, obj)
       } catch (e) {
         this.result = '解析失败: ' + ((e && e.message) || e)
       }
@@ -224,15 +254,21 @@ export default {
     async sendHex() {
       if (this.busy) return
       this.busy = 2
+      beginAction('报文控制台 · 裸报文发送')
+      let outcome = ''
       try {
+        const tk = toolkit()
         const inner = this.normalizeHex()
-        const frame = prependLength(inner)
-        const body = await ble().send(frame, 8000)
-        this.result = body ? '响应 ' + toHex(body) + '\n' + inspect(SPEC, 'FromVCSECMessage', decode(SPEC, 'FromVCSECMessage', body)) : '已发送'
+        const frame = tk.prependLength(inner)
+        const body = await ble().send(frame, 8000, true)
+        this.result = body ? this.describeResponse(tk, body) : '已发送'
+        outcome = body ? '已收到响应' : '已发送（无响应）'
       } catch (e) {
         this.result = '失败: ' + ((e && e.message) || e)
         log('error', '裸发送失败: ' + ((e && e.message) || e))
+        outcome = '失败：' + ((e && e.message) || e)
       } finally {
+        endAction(outcome)
         this.busy = 0
       }
     },

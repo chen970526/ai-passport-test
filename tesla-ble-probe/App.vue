@@ -4,7 +4,7 @@ import { keepScreenOn, logRuntimeEnv } from '@/common/tesla-ble.js'
 
 export default {
   onLaunch() {
-    log('info', 'Tesla BLE 离线钥匙探针启动（纯 JS 密码学 + uni 原生蓝牙，不依赖任何 npm 原生插件）')
+    log('info', 'Tesla BLE 离线钥匙探针启动（V3 协议 / 纯 JS 密码学 + uni 原生蓝牙，不依赖任何 npm 原生插件）')
     logRuntimeEnv(log)
     loadKey()
     // 探针全程保持亮屏：绑定要等 60 秒刷钥匙卡，息屏会让整轮作废

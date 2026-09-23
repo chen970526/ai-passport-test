@@ -3,6 +3,7 @@
     <view class="logbar">
       <text class="logcount">共 {{ list.length }} 条</text>
       <button class="btn btn-plain mini" size="mini" @click="clear">清空</button>
+      <button class="btn btn-plain mini" size="mini" @click="copy">复制</button>
       <button class="btn btn-plain mini" size="mini" @click="follow = !follow">{{ follow ? '自动滚底:开' : '自动滚底:关' }}</button>
     </view>
     <scroll-view class="scroll" scroll-y :scroll-top="scrollTop" :style="{ height: height }">
@@ -15,7 +16,8 @@
 </template>
 
 <script>
-import { getLogs, subscribe, clearLogs } from '@/common/session.js'
+import { getLogs, subscribe, clearLogs, log } from '@/common/session.js'
+import { notify, copyText } from '@/common/notify.js'
 
 export default {
   name: 'LogBox',
@@ -46,6 +48,19 @@ export default {
     clear() {
       clearLogs()
       this.list = getLogs()
+    },
+    // 把当前日志整段复制到剪贴板，这样反馈问题时不用截图
+    copy() {
+      if (!this.list.length) {
+        notify('日志是空的，没什么可复制')
+        return
+      }
+      const text = this.list.map((l) => (l.stamp ? l.stamp + ' ' : '') + l.msg).join('\n')
+      const n = this.list.length
+      copyText(text, (ok) => {
+        if (ok) log('ok', '已复制 ' + n + ' 条日志到剪贴板，直接贴文本即可')
+        else notify('当前环境不支持剪贴板（H5 请在真机 App 上用）')
+      })
     }
   }
 }
