@@ -1,5 +1,5 @@
 // SHA-1（纯 JS）。Tesla 用它派生 keyId 和 session 共享密钥。
-import { beBytes } from './bytes.js';
+import { beBytes } from '../bytes.js';
 
 const MASK = 0xffffffff;
 

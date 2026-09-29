@@ -7,11 +7,25 @@
         <input class="input" v-model="vin" placeholder="完整 VIN（用来算广播名）" @blur="saveVin" />
       </view>
       <view class="status">{{ status }}</view>
+      <view class="status">绑定档案：{{ bindInfo }}</view>
       <view class="tip">
         广播名匹配规则：新 = Tesla + VIN 后 6 位；旧 = S + SHA1(VIN) 十六进制前 16 位。
         实在不知道 VIN 也可以只填后 6 位（旧命名规则会失效）。
         车辆的蓝牙名在手机上改过、或已被系统配对过，就按这个规则匹配不上 ——
         ② 扫描并连接 会把扫到的广播全部列出来，直接点你车那一条即可。
+      </view>
+      <view class="tip">
+        绑过一次之后不用每次手选：本机会把车辆的蓝牙地址（Android 是真实 MAC、iOS 是系统给本 App 的稳定 UUID）
+        和广播名记下来，前台期间会一直试着连（连不上按 3 → 6 → 12 → 24 → 30 秒退避重试），
+        人在几十米外提前打开 App，走到车边那一轮自己就连上了，不用杀后台重开。
+        状态行最后那段「自动重连：…」会实时显示正在第几次尝试 / 几秒后重试；退到后台会暂停（系统限制），回前台自动继续。
+        点「② 扫描并连接（手选）」或「立即自动连接」连上任意一台车，同样会更新这份档案。
+        主动「断开连接」会暂停自动重连，免得你想断还连着；点「恢复自动重连」或再手动连一次即恢复。
+      </view>
+      <view class="row">
+        <button class="btn" size="mini" :loading="busy === 9" @click="manualAuto">立即自动连接</button>
+        <button class="btn btn-plain" size="mini" :loading="busy === 10" @click="resumeAuto">恢复自动重连</button>
+        <button class="btn btn-danger" size="mini" @click="clearBind">清除绑定档案</button>
       </view>
     </view>
 
@@ -108,20 +122,20 @@
 </template>
 
 <script>
-import { log, state, ble, connectTo, disconnectAll, hasKey, ensureKey, forgetKey, saveKeyPair, describeKey, namesForVin } from '@/common/session.js'
-import { ensureAndroidPermissions } from '@/common/tesla-ble.js'
-import { bindKey, checkWhitelisted, statusText, probeSession, formFactorOptions, defaultFormFactor } from '@/common/api.js'
-import { newKeyPair, bleNamesForVin } from '@/common/vcsec.js'
-import { toHex } from '@/common/bytes.js'
-import { notify } from '@/common/notify.js'
+import { log, state, ble, connectTo, disconnectAll, hasKey, ensureKey, forgetKey, saveKeyPair, describeKey, namesForVin, hasBind, forgetBind, markBound, describeBind, startAutoReconnectLoop, describeAutoLoop, suspendAutoConnect } from '@/src/services/index.js'
+import { ensureAndroidPermissions } from '@/src/infra/platform/permissions.js'
+import { bindKey, checkWhitelisted, statusText, probeSession, formFactorOptions, defaultFormFactor } from '@/src/services/vehicle-api.js'
+import { newKeyPair, bleNamesForVin } from '@/src/protocol/identity.js'
+import { VIN_STORE } from '@/src/config/index.js'
+import { toHex } from '@/src/infra/bytes.js'
+import { notify } from '@/src/infra/platform/notify.js'
 
-const VIN_STORE = 'tesla_probe_vin_v1';
 const SCAN_MS = 12000; // 手选列表的扫描窗口：再短就扫不全，再长人就开始点了
 
 export default {
   data() {
     // 钥匙类型候选值：官方 vehicle-command 把 FORM_FACTOR 定为 add-key 的必填参数、
-    // 没有默认值（commands.go:363），所以这里四个枚举值全开，默认值由 v3actions 决定。
+    // 没有默认值（commands.go:363），所以这里四个枚举值全开，默认值由 src/domain/v3-context.js 决定。
     const opts = formFactorOptions()
     const def = defaultFormFactor()
     let defName = ''
@@ -131,6 +145,7 @@ export default {
     return {
       vin: '',
       status: '',
+      bindInfo: '无绑定档案',
       busy: 0,
       picker: false,
       devices: [],
@@ -157,12 +172,13 @@ export default {
   methods: {
     tick() {
       this.status = statusText() + ' | ' + describeKey()
+      this.bindInfo = describeBind()
     },
     saveVin() {
       state.vin = (this.vin || '').trim().toUpperCase()
       if (typeof uni !== 'undefined' && uni.setStorageSync) uni.setStorageSync(VIN_STORE, state.vin)
     },
-    // 统一走可复制弹窗（见 common/notify.js），正文一律不许截断
+    // 统一走可复制弹窗（见 src/infra/platform/notify.js），正文一律不许截断
     toast(title) {
       notify(title)
     },
@@ -274,6 +290,8 @@ export default {
         const r = await bindKey(state.vin, { formFactor: this.formFactor })
         this.toast(r.text)
         log(r.ok ? 'ok' : 'warn', '绑定结论: ' + r.text)
+        // 只有车辆真的认了这把钥匙才登记 keyId —— 档案里的 keyId 是「这台车上有我这把钥匙」的凭据
+        if (r.ok) markBound()
       })
     },
     // ④ 探针：车端加白名单后通常不会回「完成」的 commandStatus（0Bu vehicle_pairing.cpp:246 实测），
@@ -283,6 +301,8 @@ export default {
         const r = await probeSession()
         this.toast(r.text)
         log(r.ok ? 'ok' : 'warn', '探针结论: ' + r.text)
+        // 探针过了 = 这把钥匙确实能在车上建会话，等同于已绑定，补记档案
+        if (r.ok) markBound()
       })
     },
     confirmCard() {
@@ -352,7 +372,33 @@ export default {
         await disconnectAll()
       })
     },
+    // 手动触发一轮「档案优先」的自动连接，同时把持续重试重新武装：
+    // 车刚唤醒、或蓝牙刚打开导致前几轮失败时用这一刀，之后交给退避循环，不必反复点。
+    async manualAuto() {
+      await this.guard(9, async () => {
+        suspendAutoConnect(false)
+        const r = await startAutoReconnectLoop('手动「立即自动连接」')
+        this.toast(
+          (r.ok ? r.text : (r.text || '自动连接未完成')) +
+          '\n' + describeAutoLoop()
+        )
+      })
+    },
+    async resumeAuto() {
+      await this.guard(10, async () => {
+        suspendAutoConnect(false)
+        const r = await startAutoReconnectLoop('恢复自动重连')
+        log('info', '已恢复自动重连：' + (hasBind() ? '前台会持续尝试连回档案里的车' : '但还没有绑定档案，需要先连一次车') +
+          '；本次结果：' + (r.ok ? r.text : (r.text || '未连上')) + '｜' + describeAutoLoop())
+      })
+    },
+    clearBind() {
+      forgetBind()
+      this.tick()
+    },
     goRke() {
+      // 原生 tabBar 已移除（图标全部内联 SVG，原生 tab 只吃 PNG），
+      // 底部导航由 tf-tabbar 组件承担，页面之间统一用 navigateTo / reLaunch。
       uni.navigateTo({ url: '/pages/rke/rke' })
     },
     goDebug() {

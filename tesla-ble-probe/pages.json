@@ -1,28 +1,70 @@
 {
-  "pages": [
-    {
-      "path": "pages/index/index",
-      "style": {
-        "navigationBarTitleText": "① 扫描·连接·绑定"
-      }
-    },
-    {
-      "path": "pages/rke/rke",
-      "style": {
-        "navigationBarTitleText": "② 上锁 / 解锁"
-      }
-    },
-    {
-      "path": "pages/debug/debug",
-      "style": {
-        "navigationBarTitleText": "③ 报文控制台"
-      }
-    }
-  ],
-  "globalStyle": {
-    "navigationBarTextStyle": "black",
-    "navigationBarTitleText": "Tesla BLE 离线钥匙探针",
-    "navigationBarBackgroundColor": "#F2F2F2",
-    "backgroundColor": "#F8F8F8"
-  }
+	"pages": [
+		{
+			"path": "pages/home/home",
+			"style": {
+				"navigationBarTitleText": "车辆"
+			}
+		},
+		{
+			"path": "pages/control/control",
+			"style": {
+				"navigationBarTitleText": "控制"
+			}
+		},
+		{
+			"path": "pages/climate/climate",
+			"style": {
+				"navigationBarTitleText": "温度"
+			}
+		},
+		{
+			"path": "pages/info/info",
+			"style": {
+				"navigationBarTitleText": "信息"
+			}
+		},
+		{
+			"path": "pages/diagnostics/diagnostics",
+			"style": {
+				"navigationBarTitleText": "诊断"
+			}
+		},
+		{
+			"path": "pages/binding/binding",
+			"style": {
+				"navigationBarTitleText": "绑定与钥匙"
+			}
+		},
+		{
+			"path": "pages/index/index",
+			"style": {
+				"navigationBarTitleText": "① 扫描·连接·绑定"
+			}
+		},
+		{
+			"path": "pages/rke/rke",
+			"style": {
+				"navigationBarTitleText": "② 动作测试"
+			}
+		},
+		{
+			"path": "pages/debug/debug",
+			"style": {
+				"navigationBarTitleText": "③ 报文控制台"
+			}
+		},
+		{
+			"path": "pages/car-control/car-control",
+			"style": {
+				"navigationBarTitleText": "④ 车控"
+			}
+		}
+	],
+	"globalStyle": {
+		"navigationBarTextStyle": "white",
+		"navigationBarTitleText": "Tesla BLE 离线钥匙探针",
+		"navigationBarBackgroundColor": "#0f1317",
+		"backgroundColor": "#0f1317"
+	}
 }

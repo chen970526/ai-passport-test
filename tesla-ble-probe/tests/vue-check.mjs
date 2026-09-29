@@ -3,11 +3,13 @@
 // 用法：node tests/vue-check.mjs
 // 说明：.vue 模板与样式不在检查范围（那部分只能靠 HBuilder X 编译）。
 
-import { readFileSync, writeFileSync, unlinkSync, readdirSync, statSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, unlinkSync, readdirSync, statSync, mkdirSync, existsSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const TMP = join(process.cwd(), 'tests', '.tmp-page');
+// 开跑前先清一次：上次若被 Ctrl+C 打断会留下半成品目录，会让「目录里有临时文件」的核对误报
+rmSync(TMP, { recursive: true, force: true });
 mkdirSync(TMP, { recursive: true });
 // pages/ 与 components/ 递归收集，另外加上根目录的 App.vue
 const DIRS = [join(process.cwd(), 'pages'), join(process.cwd(), 'components')];
@@ -51,6 +53,9 @@ for (const f of files) {
     unlinkSync(tmp);
   }
 }
+
+// 收尾：把临时目录整个删掉，跑完 tests/ 只剩两个 .mjs
+rmSync(TMP, { recursive: true, force: true });
 
 console.log(failed ? '页面脚本自检: ' + failed + ' 个文件有问题' : '页面脚本自检: 全部通过 (' + files.length + ' 个)');
 process.exit(failed ? 1 : 0);

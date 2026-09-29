@@ -31,6 +31,23 @@
     </view>
 
     <view class="card">
+      <view class="title">车机域动作（INFOTAINMENT / car_server）</view>
+      <view class="grid">
+        <view class="tile" :class="{ 'tile-on': busy === 23 }" @click="doPing">
+          <car-icon name="info" />
+          <view class="tile-name">Ping</view>
+          <view class="tile-sub">{{ busy === 23 ? '发送中…' : '车机在线探测' }}</view>
+        </view>
+        <view class="tile" :class="{ 'tile-on': busy === 24 }" @click="doVehicleData">
+          <car-icon name="car" />
+          <view class="tile-name">车辆信息</view>
+          <view class="tile-sub">{{ busy === 24 ? '发送中…' : 'GetVehicleData 全 6 类' }}</view>
+        </view>
+      </view>
+      <view class="tip">{{ infotaTip }}</view>
+    </view>
+
+    <view class="card">
       <view class="title">连续压测</view>
       <view class="row">
         <button class="btn btn-plain" size="mini" :loading="busy === 10" @click="doLoop">上锁→解锁 各 3 次</button>
@@ -46,9 +63,12 @@
 </template>
 
 <script>
-import { log } from '@/common/session.js'
-import { sendRke, sendClosure, requestEphemeralKey, queries, statusText, label, rkeEnum, closureEnum } from '@/common/api.js'
-import { notify } from '@/common/notify.js'
+import { log } from '@/src/services/index.js'
+import {
+  sendRke, sendClosure, requestEphemeralKey, queries, statusText, label, rkeEnum, closureEnum,
+  pingInfotainment, vehicleData
+} from '@/src/services/vehicle-api.js'
+import { notify } from '@/src/infra/platform/notify.js'
 
 export default {
   data() {
@@ -62,6 +82,11 @@ export default {
     actionTip() {
       return 'V3 的 RKEAction_E 只剩 0/1/20/29/30；后备箱、前备箱、充电口走 ClosureMoveRequest，' +
         '所以上面这几个按钮发的是闭锁器报文，编号只是沿用旧版的叫法。'
+    },
+    infotaTip() {
+      return '这两个动作走的是车机域（INFOTAINMENT / car_server），跟上锁解锁那条 VCSEC 不共用会话：' +
+        '两边各有各的 counter，混用会从第二条命令开始报 INVALID_TOKEN_OR_COUNTER。\n' +
+        'car_server 的状态码只有 OK / ERROR 没有 WAIT，所以第一帧就是结论；失败时把 result_reason 的原文一起打出来。'
     }
   },
   onShow() {
@@ -78,7 +103,7 @@ export default {
     tick() {
       this.status = statusText()
     },
-    // 统一走可复制弹窗（见 common/notify.js），正文一律不许截断
+    // 统一走可复制弹窗（见 src/infra/platform/notify.js），正文一律不许截断
     toast(t) {
       notify(t)
     },
@@ -140,6 +165,23 @@ export default {
       }
       return this.guard(9, async () => {
         const r = await sendRke(v, 'CUSTOM_' + v + '_' + label('RKEAction_E', v))
+        log(r.ok ? 'ok' : 'warn', r.text)
+        this.toast(r.text)
+      })
+    },
+    // ---- 车机域（INFOTAINMENT / car_server）----
+    doPing() {
+      return this.guard(23, async () => {
+        const r = await pingInfotainment()
+        log(r.ok ? 'ok' : 'warn', r.text)
+        this.toast(r.text)
+      })
+    },
+    // 不传 keys = 6 类各发一条再合并（每类都是独立请求，一类被拒不影响其它类）；
+    // 结果正文由可复制弹窗整体展示，这里不做截断
+    doVehicleData() {
+      return this.guard(24, async () => {
+        const r = await vehicleData()
         log(r.ok ? 'ok' : 'warn', r.text)
         this.toast(r.text)
       })

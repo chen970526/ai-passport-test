@@ -16,8 +16,8 @@
 </template>
 
 <script>
-import { getLogs, subscribe, clearLogs, log } from '@/common/session.js'
-import { notify, copyText } from '@/common/notify.js'
+import { getLogs, subscribe, clearLogs, log } from '@/src/services/index.js'
+import { notify, copyText } from '@/src/infra/platform/notify.js'
 
 export default {
   name: 'LogBox',

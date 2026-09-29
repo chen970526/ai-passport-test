@@ -63,9 +63,9 @@
 </template>
 
 <script>
-import { log, state, ble, connection, beginAction, endAction } from '@/common/session.js'
-import { toolkit } from '@/common/api.js'
-import { fromHex, toHex } from '@/common/bytes.js'
+import { log, state, ble, connection, beginAction, endAction } from '@/src/services/index.js'
+import { toolkit } from '@/src/services/vehicle-api.js'
+import { fromHex, toHex } from '@/src/infra/bytes.js'
 
 // V3：绑定仍是裸 ToVCSECMessage（此时还没有会话），其余是明文 RoutableMessage
 function presets(tk) {
