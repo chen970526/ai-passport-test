@@ -1088,6 +1088,128 @@ console.log('\n[11] V3 单一入口（api 转发 / 日志分段 / V3 会话 / �
     ok('写失败不再被吞：send 抛 BLE 写失败', werr.indexOf('BLE 写失败') === 0 && werr.indexOf('第 1/1 片') > 0 && werr.indexOf('errCode=-1') > 0, werr);
     ok('写失败后不留悬着的响应等待', ble.waiters.length === 0);
   }
+  {
+    // 回归锁：0x212 只接受「无响应写」时（官方 ble.go:121 用的就是 withResponse=false），
+    // 协议栈会回 property not support —— 必须换 writeType 把同一批字节重写出去，不能直接失败。
+    const seen = [];
+    const nrLogs = [];
+    globalThis.uni = {
+      writeBLECharacteristicValue: (o) => {
+        seen.push(o.writeType);
+        if (o.writeType === 'write') {
+          setTimeout(() => o.fail && o.fail({ errMsg: 'writeBLECharacteristicValue:fail property not support', errCode: 10007 }), 0);
+        } else {
+          setTimeout(() => o.success && o.success({}), 0);
+        }
+      }
+    };
+    const nr = new BleTransport({ log: (k, m) => nrLogs.push(k + ':' + m) });
+    nr.connected = true;
+    nr.deviceId = 'dev';
+    nr.serviceId = 'svc';
+    nr.writeId = 'w';
+    nr.mtu = 517;
+    nr.writeProps = { write: true, writeNoResponse: false }; // 车端谎报只支持有响应写：靠重试纠偏
+    await nr.writeChunked(frameOf(fromHex('0801')));
+    ok('property not support 会换 writeType 重试', seen.join(',') === 'write,writeNoResponse', seen.join(','));
+    ok('换写法成功有 warn 日志', nrLogs.join('\n').indexOf('换下一种写入方式重试') >= 0, nrLogs.join('\n'));
+    ok('记住本次连接的有效写法', nr.writeType === 'writeNoResponse', String(nr.writeType));
+    seen.length = 0;
+    await nr.writeChunked(frameOf(fromHex('0802')));
+    ok('后续写入直接用已确认的写法，不再试探', seen.join(',') === 'writeNoResponse', seen.join(','));
+  }
+  {
+    // 回归锁：非属性类错误绝不重发 —— 前一片可能已经落进车端组包缓冲，重复发会拼出坏帧。
+    const seen = [];
+    globalThis.uni = {
+      writeBLECharacteristicValue: (o) => {
+        seen.push(o.writeType);
+        setTimeout(() => o.fail && o.fail({ errMsg: 'writeBLECharacteristicValue:fail invalid handle', errCode: -1 }), 0);
+      }
+    };
+    const one = new BleTransport({});
+    one.connected = true;
+    one.mtu = 517;
+    let oerr = '';
+    try {
+      await one.writeChunked(frameOf(fromHex('0801')));
+    } catch (e) {
+      oerr = e.message;
+    }
+    ok('非属性错误只发一次就抛', seen.length === 1 && oerr.indexOf('第 1/1 片（4 字节，偏移 0）写入失败') === 0 && oerr.indexOf('invalid handle') > 0, oerr);
+    ok('每片都显式带上 writeType', String(seen[0]) === 'writeNoResponse', String(seen[0]));
+  }
+  {
+    // 回归锁：uni 的 10008 是 system error（文档：notify 成功后立刻写，部分机型报 10008），
+    // 不属于「写法与属性不匹配」，绝不许换写法重发 —— 重复字节会把车端的组包缓冲拼坏。
+    const seen = [];
+    globalThis.uni = {
+      writeBLECharacteristicValue: (o) => {
+        seen.push(o.writeType);
+        setTimeout(() => o.fail && o.fail({ errMsg: 'writeBLECharacteristicValue:fail', errCode: 10008 }), 0);
+      }
+    };
+    const sys = new BleTransport({});
+    sys.connected = true;
+    sys.mtu = 517;
+    let serr = '';
+    try {
+      await sys.writeChunked(frameOf(fromHex('0801')));
+    } catch (e) {
+      serr = e.message;
+    }
+    ok('10008 系统错误不换写法重发', seen.length === 1 && serr.indexOf('已试 writeType') < 0 && serr.indexOf('errCode=10008') > 0, serr);
+  }
+  {
+    // 回归锁：基座只回 errCode=10007、errMsg 里没有英文关键字时也要认成「属性不支持」
+    const seen = [];
+    globalThis.uni = {
+      writeBLECharacteristicValue: (o) => {
+        seen.push(o.writeType);
+        const bad = o.writeType === 'writeNoResponse';
+        setTimeout(() => (bad ? o.fail : o.success)({ errMsg: 'writeBLECharacteristicValue:fail', errCode: bad ? 10007 : 0 }), 0);
+      }
+    };
+    const code = new BleTransport({});
+    code.connected = true;
+    code.mtu = 517;
+    await code.writeChunked(frameOf(fromHex('0801')));
+    ok('只凭 errCode=10007 也会换写法重试成功', seen.join(',') === 'writeNoResponse,write' && code.writeType === 'write', seen.join(','));
+  }
+  {
+    // 回归锁：属性两种平台形状（对象 / Android 位掩码 0x08|0x04）都要解析出来，
+    // 并把 0211 的特征清单打进日志 —— 真机上看不到属性就只能猜。
+    const logs = [];
+    const probe = new BleTransport({ log: (k, m) => logs.push(k + ':' + m) });
+    probe.deviceId = 'dev';
+    globalThis.uni = {
+      getBLEDeviceServices: (o) => setTimeout(() => o.success({ services: [{ uuid: '00000211-B2D1-43F0-9B88-960CEBF8B91E' }] }), 0),
+      getBLEDeviceCharacteristics: (o) => setTimeout(() => o.success({
+        characteristics: [
+          { uuid: '00000212-B2D1-43F0-9B88-960CEBF8B91E', properties: { read: false, write: false, writeNoResponse: true } },
+          { uuid: '00000213-B2D1-43F0-9B88-960CEBF8B91E', properties: { read: true, write: false, writeNoResponse: false, indicate: true } },
+          { uuid: '00000214-B2D1-43F0-9B88-960CEBF8B91E', properties: 0x02 }
+        ]
+      }), 0)
+    };
+    await probe.discoverServices();
+    ok('发现服务会解析 0x212 写属性', !!probe.writeProps && probe.writeProps.writeNoResponse === true && probe.writeProps.write === false, JSON.stringify(probe.writeProps));
+    ok('只支持无响应写时首选 writeNoResponse', probe.writeTypeOrder()[0] === 'writeNoResponse' && probe.writeTypeOrder()[1] === 'write', probe.writeTypeOrder().join(','));
+    ok('特征清单进日志', logs.join('\n').indexOf('0211 特征清单') >= 0 && logs.join('\n').indexOf('0212(write=n writeNoResponse=y)') >= 0, logs.join('\n'));
+    const mask = new BleTransport({});
+    mask.deviceId = 'dev';
+    globalThis.uni = {
+      getBLEDeviceServices: (o) => setTimeout(() => o.success({ services: [{ uuid: '00000211-b2d1-43f0-9b88-960cebf8b91e' }] }), 0),
+      getBLEDeviceCharacteristics: (o) => setTimeout(() => o.success({
+        characteristics: [
+          { uuid: '00000212-b2d1-43f0-9b88-960cebf8b91e', properties: 0x08 | 0x04 },
+          { uuid: '00000213-b2d1-43f0-9b88-960cebf8b91e', properties: 0x20 }
+        ]
+      }), 0)
+    };
+    await mask.discoverServices();
+    ok('位掩码形式的属性也认', mask.writeProps.write === true && mask.writeProps.writeNoResponse === true, JSON.stringify(mask.writeProps));
+  }
   delete globalThis.uni;
   const off = new BleTransport({});
   let offErr = '';
@@ -2396,6 +2518,29 @@ console.log('\n[18] 路由与界面字面量（静态扫描：防死链 / 防字
     // 界面不许替车辆下结论：只能写「回执通过 / 回执拒绝」，不能出现自造的启动状态
     ok('按钮文案不伪造启动状态',
       ctlSrc.indexOf('已启动') < 0 && ctlSrc.indexOf('启动成功') < 0 && ctlSrc.indexOf('车辆回执通过') > 0);
+
+    // 首页快捷动作就是控制页那两个：动作实现 + 确认文案都必须逐字相同，
+    // 否则同一台车在两个页面上会有两套后果（用户明确要求「两边要一致」）。
+    const homeSrc = read('pages/home/home.vue');
+    const attr = (re) => { const m = ctlSrc.match(re); return m ? m[1] : '(控制页没找到)'; };
+    const dlg = (key) => {
+      const s = homeSrc.indexOf('  ' + key + ': {');
+      const block = homeSrc.slice(s, homeSrc.indexOf('  },', s));
+      const g = (f) => { const m = block.match(new RegExp(f + ": '([^']+)'")); return m ? m[1] : '(首页没找到)'; };
+      return { title: g('title'), desc: g('desc'), tip: g('tip'), ok: g('ok') };
+    }
+    const hu = dlg('unlock');
+    ok('首页解锁也走 unlockAndDrive()（且不再自己拼解锁载荷）',
+      homeSrc.indexOf('unlockAndDrive()') >= 0 && homeSrc.indexOf('RKE_ACTION_UNLOCK') < 0,
+      homeSrc.slice(homeSrc.indexOf('onConfirm()'), homeSrc.indexOf('doLock()')));
+    ok('首页与控制页的解锁确认文案逐字一致',
+      hu.title === attr(/title="([^"]+)"/) && hu.desc === attr(/desc="([^"]+)"/) && hu.tip === attr(/tip="([^"]+)"/) && hu.ok === attr(/confirm-text="([^"]+)"/),
+      JSON.stringify(hu));
+    ok('首页解锁同样是三秒倒计时 + 危险色',
+      homeSrc.indexOf("dlg === 'unlock' ? 3 : 0") > 0 && homeSrc.indexOf("dlg === 'unlock'") > 0);
+    ok('首页上锁与控制页是同一个调用（LOCK 载荷 + busy 码 11）',
+      homeSrc.slice(homeSrc.indexOf('doLock()')).indexOf("sendRke(rkeEnum('RKE_ACTION_LOCK'), 'LOCK')") > 0 &&
+      ctlSrc.slice(ctlSrc.indexOf('doLock()')).indexOf("sendRke(rkeEnum('RKE_ACTION_LOCK'), 'LOCK')") > 0);
   }
 }
 
