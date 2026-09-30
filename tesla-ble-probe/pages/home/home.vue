@@ -101,7 +101,7 @@
 
 <script>
 import { log, bind, connection, vehicleView, subscribeVehicle, startAutoReconnectLoop, stopAutoReconnectLoop, describeAutoLoop, hasBind, hasKey, describeBind, lastResult } from '@/src/services/index.js'
-import { statusText, sendRke, sendClosure, rkeEnum, closureEnum, pingInfotainment, vehicleData, vehicleDataAll } from '@/src/services/vehicle-api.js'
+import { statusText, sendRke, sendClosure, rkeEnum, closureEnum, pingInfotainment, vehicleData, vehicleDataAll, unlockAndDrive } from '@/src/services/vehicle-api.js'
 import { ago, unit, yesNo } from '@/src/ui/format.js'
 import { notify } from '@/src/infra/platform/notify.js'
 
@@ -116,8 +116,8 @@ const CONN = {
 const DLG = {
   unlock: {
     title: '确认解锁全部车门？',
-    desc: '四个车门和后备箱会同时失去锁定，车辆不会自动重新上锁。',
-    tip: '人不在车边不要点确认。',
+    desc: '四个车门和后备箱会同时失去锁定，车辆不会自动重新上锁。解锁成功后还会紧跟着发一条驾驶授权。',
+    tip: '人不在车边不要点确认。授权被拒不影响解锁本身，回执会分开写。',
     ok: '解锁'
   },
   frunk: {
@@ -280,7 +280,8 @@ export default {
       this.dlg = ''
       if (key === 'unlock') {
         return this.guard(12, async () => {
-          this.report(await sendRke(rkeEnum('RKE_ACTION_UNLOCK'), 'UNLOCK'))
+          // 与控制页同一个动作：解锁成功后串发驾驶授权，页面不自己拼 RKE 载荷
+          this.report(await unlockAndDrive())
         })
       }
       if (key === 'frunk' || key === 'trunk') {

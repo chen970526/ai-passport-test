@@ -26,6 +26,50 @@ export { makeMatcher, sortAdv, normName, hasTeslaService, payloadCap };
 // send() 按参数决定是否清空 —— 旧版「一问一答」行为完全不变。
 const BUFFERED_MAX = 8;
 
+// ---------------------------------------------------------- 0x212 的写入方式
+// 官方 vehicle-command 对 0x212 用的是「无响应写」：
+//   pkg/connector/ble/ble.go:121  WriteCharacteristic(txChar, out[:blockLength], false)
+// uni 不传 writeType 时由运行时自己挑（文档：iOS 优先 write、安卓优先 writeNoResponse），
+// 挑错就回 errCode=10007 "property not support"（当前特征值不支持此操作）。
+// 这里显式指定 writeType，并在被回「属性不支持」时换另一种写法重试同一批字节。
+const WRITE_NR = 'writeNoResponse';
+const WRITE_REQ = 'write';
+
+// getBLEDeviceCharacteristics 的 properties 各端形状不一样：
+// 多数是 {write, writeNoResponse, notify, indicate}，个别安卓基座回位掩码数字。
+function describeWriteProps(ch) {
+  const p = ch && ch.properties;
+  if (!p) return null;
+  if (typeof p === 'number') {
+    // Android BluetoothGattCharacteristic: WRITE=0x08, WRITE_NO_RESPONSE=0x04
+    return { write: (p & 0x08) !== 0, writeNoResponse: (p & 0x04) !== 0 };
+  }
+  return { write: !!p.write, writeNoResponse: !!(p.writeNoResponse || p.writeWithoutResponse) };
+}
+
+function writePropsText(p) {
+  if (!p) return '未上报';
+  return 'write=' + (p.write ? 'y' : 'n') + ' writeNoResponse=' + (p.writeNoResponse ? 'y' : 'n');
+}
+
+function writeTypeCandidates(props) {
+  const out = [];
+  if (props && props.writeNoResponse) out.push(WRITE_NR); // 官方口径优先
+  if (props && props.write) out.push(WRITE_REQ);
+  // 车端上报的属性未必完整，安卓基座也可能读漏：没在清单里的写法一律留作兜底，
+  // 真被协议栈回 property not support 时才有第二次机会。
+  if (out.indexOf(WRITE_NR) < 0) out.push(WRITE_NR);
+  if (out.indexOf(WRITE_REQ) < 0) out.push(WRITE_REQ);
+  return out;
+}
+
+// uni 的错误表：10007 = property not support（特征值不支持此操作），10008 = system error。
+// 只有前者才说明是「写法与属性不匹配」，换 writeType 才有意义；10008 之类不许重发。
+function isPropertyReject(text) {
+  const t = String(text || '').toLowerCase();
+  return t.indexOf('property not support') >= 0 || t.indexOf('errcode=10007') >= 0;
+}
+
 export class BleTransport {
   constructor(handlers) {
     const h = handlers || {};
@@ -40,6 +84,8 @@ export class BleTransport {
     this.characteristics = [];
     this.serviceId = null;
     this.writeId = null;
+    this.writeProps = null; // 0x212 上报的写属性，排查「property not support」用
+    this.writeType = null; // 本连接里已被车端接受的写入方式，一旦确定就不再试探
     this.indicateId = null;
     this.versionId = null;
     this.reassembler = new FrameReassembler({
@@ -301,10 +347,20 @@ export class BleTransport {
     this.serviceId = svc.uuid;
     const charList = await bleApi('getBLEDeviceCharacteristics', { deviceId: this.deviceId, serviceId: svc.uuid });
     this.characteristics = charList.characteristics || [];
-    this.writeId = (this.characteristics.find((c) => matchUuid(c.uuid, GATT.write)) || {}).uuid;
+    const writeChar = this.characteristics.find((c) => matchUuid(c.uuid, GATT.write)) || null;
+    this.writeId = writeChar ? writeChar.uuid : null;
     this.indicateId = (this.characteristics.find((c) => matchUuid(c.uuid, GATT.indicate)) || {}).uuid;
     this.versionId = (this.characteristics.find((c) => matchUuid(c.uuid, GATT.version)) || {}).uuid;
+    // 每次重新发现服务都按车端上报的属性重算写入方式，不要沿用上一次的判定
+    this.writeProps = describeWriteProps(writeChar);
+    this.writeType = null;
     this.log('ok', '服务 0211 已就绪 write=' + (this.writeId ? '0212' : '缺') + ' indicate=' + (this.indicateId ? '0213' : '缺') + ' read=' + (this.versionId ? '0214' : '缺'));
+    this.log('info', '0x212 写属性: ' + writePropsText(this.writeProps) + '，准备按 ' +
+      writeTypeCandidates(this.writeProps).join(' / ') + ' 顺序写入');
+    // 车端到底上报了哪些特征、各自什么属性，是真机排查「property not support」唯一的事实来源
+    this.log('info', '0211 特征清单: ' + this.characteristics.map((c) =>
+      String(c.uuid).replace(/^0000(....).*$/, '$1') + '(' + writePropsText(describeWriteProps(c)) +
+      (c.properties && (c.properties.notify || c.properties.indicate) ? ' notify/indicate' : '') + ')').join(' '));
     if (!this.writeId || !this.indicateId) {
       throw new Error('0212/0213 特征不全，无法收发 VCSEC 报文');
     }
@@ -457,19 +513,54 @@ export class BleTransport {
     let idx = 0;
     for (let off = 0; off < frame.length; off += cap) {
       const size = Math.min(cap, frame.length - off);
+      await this.writePart(frame.subarray(off, off + size), idx + 1, parts, off);
+      idx++;
+      await delay(20); // 给车机一点处理时间，避免连写丢包
+    }
+  }
+
+  // 写一片。只有「写属性不匹配」这类拒绝才换 writeType 重试（换写法不会让车端多收或少收字节）；
+  // 其它错误立刻原样上抛，绝不重发 —— 前一片已经落进车端组包缓冲，重复发会拼出坏帧。
+  async writePart(chunk, partNo, parts, offset) {
+    const order = this.writeTypeOrder();
+    const tried = [];
+    let lastErr = null;
+    for (const wt of order) {
+      tried.push(wt);
       try {
         await bleApi('writeBLECharacteristicValue', {
           deviceId: this.deviceId,
           serviceId: this.serviceId,
           characteristicId: this.writeId,
-          value: bytesToAb(frame.subarray(off, off + size))
+          writeType: wt,
+          value: bytesToAb(chunk)
         });
+        if (this.writeType !== wt) {
+          this.writeType = wt;
+          this.log('info', '写入方式 = ' + wt + '（0x212 属性 ' + writePropsText(this.writeProps) + '），本次连接后续都按它写');
+        }
+        return;
       } catch (e) {
-        throw new Error('第 ' + (idx + 1) + '/' + parts + ' 片（' + size + ' 字节，偏移 ' + off + '）写入失败：' + errText(e));
+        lastErr = e;
+        const text = errText(e);
+        if (!isPropertyReject(text)) break;
+        this.log('warn', wt + ' 写入被拒（' + text + '），换下一种写入方式重试');
       }
-      idx++;
-      await delay(20); // 给车机一点处理时间，避免连写丢包
     }
+    const text = errText(lastErr);
+    const hint = isPropertyReject(text)
+      ? '（已试 writeType=' + tried.join(' / ') + '；0x212 属性 ' + writePropsText(this.writeProps) +
+        '，MTU=' + this.mtu + ' 每包上限 ' + payloadCap(this.mtu) + ' 字节）'
+      : '';
+    throw new Error('第 ' + partNo + '/' + parts + ' 片（' + chunk.length + ' 字节，偏移 ' + offset + '）写入失败：' + text + hint);
+  }
+
+  writeTypeOrder() {
+    const cands = writeTypeCandidates(this.writeProps);
+    if (this.writeType && cands.indexOf(this.writeType) >= 0) {
+      return [this.writeType].concat(cands.filter((x) => x !== this.writeType));
+    }
+    return cands;
   }
 
   async readVersion() {
