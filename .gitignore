@@ -7,6 +7,9 @@ nvs_backup_*.bin
 nvs-before-*.bin
 nvs-after-*.bin
 nvs-2026*.bin
+# 相对路径口径（见 tesla-key-context.md §2）：备份与串口日志都放仓库内这两个目录
+nvs-backups/
+logs/
 
 # 构建产物（ai-passport/.gitignore 与 tesla-ble-probe/.gitignore 已覆盖各自目录，此处兜底）
 build/
