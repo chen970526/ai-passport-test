@@ -1223,20 +1223,20 @@ console.log('\n[11] V3 单一入口（api 转发 / 日志分段 / V3 会话 / �
 
 console.log('\n[12] 广播手选列表（makeMatcher / sortAdv）');
 {
-  const names = { exact: ['Tesla723591'], prefixes: ['S4adfe3eacbdb58b7'] };
+  const names = { exact: ['Tesla000000'], prefixes: ['See13c959535a3b7d'] };
   const m = makeMatcher(names);
-  ok('精确命中', m('Tesla723591').mode === 'exact');
-  ok('前缀命中', m('S4adfe3eacbdb58b7C').mode === 'prefix' && m('S4adfe3eacbdb58b7C').matched === 'S4adfe3eacbdb58b7');
-  ok('分隔符差异宽松命中', m('Tesla 723591').mode === 'loose' && m('tesla_723591').mode === 'loose');
-  ok('前缀的大小写/分隔符差异也认', m('s4-adfe3eacbdb58b7-extra').mode === 'loose-prefix');
+  ok('精确命中', m('Tesla000000').mode === 'exact');
+  ok('前缀命中', m('See13c959535a3b7dC').mode === 'prefix' && m('See13c959535a3b7dC').matched === 'See13c959535a3b7d');
+  ok('分隔符差异宽松命中', m('Tesla 000000').mode === 'loose' && m('tesla_000000').mode === 'loose');
+  ok('前缀的大小写/分隔符差异也认', m('se-e13c959535a3b7d-extra').mode === 'loose-prefix');
   ok('改过名就不命中', m('Tesla Model Y 小米YU7') === null && m('midea') === null);
   ok('空名不报错', m('') === null && m(undefined) === null);
   const empty = makeMatcher(undefined);
-  ok('没有期望名时一律不命中', empty('S4adfe3eacbdb58b7C') === null);
+  ok('没有期望名时一律不命中', empty('See13c959535a3b7dC') === null);
 
   const list = sortAdv([
     { deviceId: 'd1', name: 'midea', rssi: -50, tesla: false, hit: null },
-    { deviceId: 'd2', name: 'S4adfe3eacbdb58b7C', rssi: -90, tesla: false, hit: 'S4adfe3eacbdb58b7' },
+    { deviceId: 'd2', name: 'See13c959535a3b7dC', rssi: -90, tesla: false, hit: 'See13c959535a3b7d' },
     { deviceId: 'd3', name: '', rssi: -40, tesla: true, hit: null },
     { deviceId: 'd4', name: 'weclamp', rssi: -60, tesla: false, hit: null },
     { deviceId: 'd5', name: '', rssi: -55, tesla: false, hit: null }
@@ -2141,8 +2141,8 @@ console.log('\n[16] 自动重连循环（前台持续重试 / 退避升档 / 断
 
   // ② 真实场景：有密钥 + 有档案，但车不在范围（这里用适配器不可用代表「这次连不上」）
   const kp = vcsec.newKeyPair();
-  saveKeyPair(kp, '5YJ3E1EA7KF327239');
-  saveBind({ vin: '5YJ3E1EA7KF327239', deviceId: 'AA:BB:CC:11:22:33', name: 'Tesla723591', keyId: 'aabbccddeeff0011' });
+  saveKeyPair(kp, '5YJ3E1EA7KF000000');
+  saveBind({ vin: '5YJ3E1EA7KF000000', deviceId: 'AA:BB:CC:11:22:33', name: 'Tesla000000', keyId: 'aabbccddeeff0011' });
   connection.connection = 'idle';
   clearLogs();
   {

@@ -49,5 +49,12 @@ tlb_match_mode_t tlb_match_adv_name(const tlb_ble_names_t *names, const char *ad
 // 这是探针既有行为，照抄不改；无名广播兜底因此只在回短格式时生效。
 bool tlb_uuid_is_tesla_service(const char *uuid);
 
+// 引导列表的形状识别（不依赖 VIN 规则）：广播名本身长得像特斯拉车就判 true。
+// 两种实测定案形状——
+//   老款车：'S' + 16 个十六进制字符 + 可选尾缀 [C/R/D/P]（VIN 的 SHA1 前缀，无 VIN 也可识别）；
+//   新款车：'Tesla' 前缀 + 恰好 6 位 VIN 尾号（中间有无空格都算，大小写不敏感）。
+// 误伤面：随机设备要恰好 'S'+16 位连续 hex 或 'Tesla'+6 位尾号才误判，可忽略。
+bool tlb_name_looks_like_tesla(const char *adv_name);
+
 // 广播里是否带了特斯拉 VCSEC 服务（任一 UUID 命中即为真）
 bool tlb_has_tesla_service(const char *const *uuids, size_t n);

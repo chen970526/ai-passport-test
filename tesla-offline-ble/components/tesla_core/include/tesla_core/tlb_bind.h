@@ -28,8 +28,9 @@
 // 探针文案 = 握手 msg（TLB_TEXT_MAX）+ 「会话已建立（…）」的包裹
 #define TLB_PROBE_TEXT_MAX (TLB_TEXT_MAX + 64)
 
-// 探针 enrollment-service.js:131 的 name
-#define TLB_BIND_NAME "AddKey（刷卡配对）"
+// 车机钥匙列表里显示的名字（用户定案社区品牌名；旧值「AddKey（刷卡配对）」
+// 仅探针参考实现用过，无任何协议/服务依赖此字面量，改名安全）。
+#define TLB_BIND_NAME "AI-passport"
 
 // 探针 pick()：只接受「有限正数」，否则回落默认值 —— C 侧等价判据是 opts==NULL || v<=0
 typedef struct {

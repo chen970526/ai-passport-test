@@ -174,7 +174,7 @@ tesla-ble-probe/
 | 调用链 | `src/domain/connection-service.js:namesForVin(vin)` → `src/protocol/identity.js:bleNamesForVin(vin)` → `src/infra/bytes.js:utf8ToBytes/toHex` + `src/infra/crypto/sha1.js:sha1` |
 | 用到接口 | 无（纯 JS） |
 | 实现方式 | 返回 `{exact:[], prefixes:[]}` 两组：<br>`exact` = `Tesla ` + **VIN 后 6 位**（2023-06-21 起的新命名，只需后 6 位）<br>`prefixes` = `S` + `SHA1(完整 VIN 的 UTF-8)` 的十六进制**前 16 位**（老命名，末位 C/R/D/P 未知 → 只能做前缀匹配，**必须完整 VIN**） |
-| 已核对样例 | VIN `LRWYGCEJ0TC723591` → `Tesla 723591` / `S4adfe3eacbdb58b7`（与 App 日志输出一致，`node crypto` 独立复算过） |
+| 已核对样例 | VIN `5YJ3E1EA7KF000000` → `Tesla 000000` / `See13c959535a3b7d`（`node crypto` 独立复算过的假 VIN 夹具，绝不用真实车辆 VIN） |
 | 失败判读 | 只填后 6 位时老命名规则失效（`prefixes` 为空，只剩 `Tesla ` + 后 6 位这一条精确名）；VIN 完全留空时自动路径直接抛 `请先填写 VIN…`，此时走 F5.1 手选 |
 | **规则失效的情形** | 车辆蓝牙名在车机里改过（如 `Tesla Model Y 小米YU7`）、或手机系统里已配对并被缓存成新名字 → **按 VIN 算出来的名字根本匹配不上**。这不是 bug，是命名规则本身被人为改掉了；对策见 F5.1 的手选弹窗 |
 
@@ -185,7 +185,7 @@ tesla-ble-probe/
 | UI 入口 | 「② 扫描并连接（手选）」（`step2` → 打开弹窗 → `rescan` / `pick` / `autoConnect`）；「列出周围广播」（`allAdvs` → `scanAll`） |
 | 调用链 | 自动路径：`index.vue:autoConnect` → `src/domain/connection-service.js:connectTo(vin)` → `BleTransport.scan(names, 20000)`（命中即停）<br>手选路径：`index.vue:rescan` → `BleTransport.discover(12000, names, onFound)`（全量收集）→ `index.vue:pick(d)` → `src/domain/connection-service.js:connectTo(vin, d)`（**跳过名字匹配，直连指定设备**） |
 | 用到接口 | `uni.onBluetoothDeviceFound(cb)`、`uni.startBluetoothDevicesDiscovery({allowDuplicatesKey:false, powerLevel:'high', interval:0})`、`uni.stopBluetoothDevicesDiscovery()`、`uni.offBluetoothDeviceFound()`（老版本无此 API，已 try/catch） |
-| 实现方式 | 匹配逻辑抽成 `src/infra/ble/device-matcher.js:makeMatcher(names)`（可离线断言），四级：<br>1) `exact` 精确等值；2) `prefixes` 前缀；3) `normName()`（去掉所有非字母数字并转大写）后的等值，吸收 `Tesla 723591` / `Tesla_723591` / `tesla723591`；<br>4) 归一化后的前缀（`s4-adfe3eacbdb58b7-extra` 这类带后缀的老命名）；<br>另有一条独立旁证：广播**无名字**但 `advertisServiceUUIDs` 里带 `0211`（VCSEC 服务）→ 认作疑似车辆（`hasTeslaService`）；<br>名字含 `TESLA` 但没命中期望名 → 单独打 `warn` 把**真实广播名 + rssi** 打出来 |
+| 实现方式 | 匹配逻辑抽成 `src/infra/ble/device-matcher.js:makeMatcher(names)`（可离线断言），四级：<br>1) `exact` 精确等值；2) `prefixes` 前缀；3) `normName()`（去掉所有非字母数字并转大写）后的等值，吸收 `Tesla 000000` / `Tesla_000000` / `tesla000000`；<br>4) 归一化后的前缀（`se-e13c959535a3b7d-extra` 这类带后缀的老命名）；<br>另有一条独立旁证：广播**无名字**但 `advertisServiceUUIDs` 里带 `0211`（VCSEC 服务）→ 认作疑似车辆（`hasTeslaService`）；<br>名字含 `TESLA` 但没命中期望名 → 单独打 `warn` 把**真实广播名 + rssi** 打出来 |
 | 成功标志 | `发现车辆 name=... (exact/prefix/loose/loose-prefix 命中 X) id=...` |
 | 失败判读 | `扫描 20000ms 未发现目标车辆` → 车没在广播（人不在车边 / 车机蓝牙被关闭 / 车辆深度睡眠导致广播间隔很长）或**名字被改过**。后者用 F5.1 手选 |
 | 排查按钮 | 「列出周围广播」用 `scanAll(10000)` 只收集不匹配，输出 `名字 + deviceId`（无名设备用 `(无名) + deviceId 后 8 位`，不折叠），并对期望名标 `★命中` |

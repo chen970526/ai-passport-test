@@ -16,6 +16,14 @@
 // UNLOCK=0 也必须写 tag，否则报文退化成 0 字节，车辆只会回 WAIT。
 size_t tlb_msg_encode_rke(uint32_t action, uint8_t *out, size_t cap);
 
+// UnsignedMessage{closureMoveRequest}：lid 0=前备箱（frontTrunk 字段 6）、1=后备箱（rearTrunk 字段 5），
+// 移动类型 ClosureMoveType_E.OPEN=3。整条同样是 oneof，tag 必写。
+size_t tlb_msg_encode_closure(int lid, uint8_t *out, size_t cap);
+
+// UnsignedMessage{InformationRequest{}}：GET_STATUS=0 按 proto3 省略 → 空子消息 0A 00，
+// 车辆回一条 FromVCSECMessage{vehicleStatus}。
+size_t tlb_msg_encode_status_query(uint8_t *out, size_t cap);
+
 // session_info 握手请求：to_destination → from_destination → session_info_request → uuid
 size_t tlb_msg_encode_handshake_request(uint32_t domain, const uint8_t *routing_address,
                                        const uint8_t *public_key, const uint8_t *uuid, uint8_t *out,
@@ -177,7 +185,15 @@ typedef struct {
     const uint8_t *wl_signer;
     size_t wl_signer_len;
     bool has_vehicle_status;
-    // 内层字段本核心不解析（偏离），但 inspect 的键名要有，所以只留存在位
+    // vehicleStatus 内层（本核心解析的三个字段）。内层解析失败时这几项清零、标志回 false，
+    // 但 has_vehicle_status 不受影响 —— inspect/summarize 的文本逐字不变。
+    bool has_closure_status;
+    uint8_t closure_state[8]; // ClosureStatuses 字段 1..8：前左 前右 后左 后右 后备箱 前备箱 充电口 卷盖板
+    bool has_vehicle_lock_state;
+    uint32_t vehicle_lock_state; // VehicleLockState_E：UNLOCKED=0 LOCKED=1
+    bool has_vehicle_sleep_status;
+    uint32_t vehicle_sleep_status;
+    // whitelistInfo/whitelistEntryInfo 内层仍不解析（偏离），但 inspect 的键名要有，只留存在位
     bool has_whitelist_info;
     bool has_whitelist_entry_info;
     bool has_nominal_error;

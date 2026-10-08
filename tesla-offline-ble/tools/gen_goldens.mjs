@@ -201,7 +201,7 @@ async function protocolSections() {
   const DOMAIN = C.DOMAIN;
   const SIGTYPE = C.SIGTYPE;
   const MAX_EPOCH = C.MAX_EPOCH_SECONDS; // authentication.epochLength = 1<<30
-  const VIN = 'LRWYGCEJ0TC723591';
+  const VIN = '5YJ3E1EA7KF000000'; // 假 VIN 夹具（上架脱敏：绝不用真实车辆 VIN）
   // 固定夹具：全部用带种子的 LCG，保证金标准可复现
   const pub65 = (seed) => { const b = prng(65, seed); b[0] = 0x04; return b; };
   const KEY = prng(16, 900);
@@ -842,7 +842,7 @@ async function dispatchSections() {
     if (v === undefined) throw new Error('GenericError_E 没有 ' + k);
     return v;
   };
-  const VIN = 'LRWYGCEJ0TC723591';
+  const VIN = '5YJ3E1EA7KF000000'; // 假 VIN 夹具（上架脱敏）
   const CTX_ADDR = prng(16, 9001), CTX_UUID = prng(16, 9002), REQ_ID = prng(16, 9003);
   const OTHER_ADDR = prng(16, 9004), OTHER_UUID = prng(16, 9005), SES_KEY = prng(16, 9006);
   const CT = prng(20, 9007), R_NONCE = prng(12, 9008), R_TAG = prng(16, 9009), WL_SHA = prng(20, 9010);
@@ -1377,7 +1377,7 @@ async function identitySections() {
 
   // normName：丢分隔符 + 转大写
   {
-    const IN = ['', 'Tesla 723591', 'tesla_723591', '  TESLA-723591 ', '中文 Tesla 名',
+    const IN = ['', 'Tesla 000000', 'tesla_000000', '  TESLA-000000 ', '中文 Tesla 名',
       'sa1b2c3d4e5f6071', '0x0211', 'ÿSt0_2-11', '  ', 'AB'.repeat(19)];
     const rows = [];
     IN.forEach((s, i) => {

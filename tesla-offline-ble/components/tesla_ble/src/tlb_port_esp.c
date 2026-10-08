@@ -88,9 +88,12 @@ bool tlb_port_ecdh(const uint8_t priv[TLB_PRIV_LEN], const uint8_t pub[TLB_PUB_L
         ESP_LOGW(TAG, "对端公钥不在 P-256 曲线上 -0x%04x", -rc);
         goto done;
     }
-    // f_rng 传 NULL：ECDH 不需要盲因子（与探针定死时序的纯量乘法等价，
-    // 副作用只是侧信道防护等级，不改变任何一个输出字节）
-    rc = mbedtls_ecp_mul(&grp, &point, &d, &point, NULL, NULL);
+    // f_rng **不能**传 NULL：mbedTLS 3.x 的 mbedtls_ecp_mul_restartable 入口有硬守卫
+    // （ecp.c 里 `if (f_rng == NULL) return MBEDTLS_ERR_ECP_BAD_INPUT_DATA;`），
+    // 传 NULL 会当场 -0x4F80 早退，连纯量乘法都不会开始 —— 真机 handshake 就是死在这。
+    // 这里补上 ESP 硬件真随机：随机化只改内部仿射坐标的表示（侧信道防护），
+    // 归一化后的仿射 X 与探针逐字节相同，不影响任何一个输出字节。
+    rc = mbedtls_ecp_mul(&grp, &point, &d, &point, tlb_rng, NULL);
     if (rc != 0) {
         ESP_LOGW(TAG, "ECDH 点乘失败 -0x%04x", -rc);
         goto done;

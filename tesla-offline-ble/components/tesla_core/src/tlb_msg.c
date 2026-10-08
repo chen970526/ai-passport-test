@@ -20,6 +20,40 @@ size_t tlb_msg_encode_rke(uint32_t action, uint8_t *out, size_t cap)
     return tlb_wb_len(&w);
 }
 
+size_t tlb_msg_encode_closure(int lid, uint8_t *out, size_t cap)
+{
+    // encode(SPEC,'UnsignedMessage',{ closureMoveRequest: { frontTrunk|rearTrunk: OPEN } })
+    // closureMoveRequest 是 oneof 字段 4（内层先写、外层再包 LEN）；lid 0=前备箱（frontTrunk 字段 6）、
+    // 1=后备箱（rearTrunk 字段 5）。字段类型是 ClosureMoveType_E，OPEN=3 —— 不是 ClosureState_E 的 OPEN=1。
+    // 产物（供核对）：lid=0 → 22 02 30 03；lid=1 → 22 02 28 03。
+    uint8_t cmr_buf[16];
+    tlb_wb_t cmr, w;
+    tlb_wb_init(&cmr, cmr_buf, sizeof(cmr_buf));
+    if (!tlb_wb_u32(&cmr, lid == 0 ? 6 : 5, TLB_CLOSURE_MOVE_OPEN, false)) {
+        return 0;
+    }
+    tlb_wb_init(&w, out, cap);
+    if (!tlb_wb_sub(&w, 4, &cmr)) { // oneof 成员：tlb_wb_sub 无条件写 tag+len
+        return 0;
+    }
+    return tlb_wb_len(&w);
+}
+
+size_t tlb_msg_encode_status_query(uint8_t *out, size_t cap)
+{
+    // encode(SPEC,'UnsignedMessage',{ InformationRequest: {} })
+    // informationRequestType = GET_STATUS = 0，proto3 省略 → 空子消息，产物 0A 00（供核对）。
+    // 车辆回一条 FromVCSECMessage{vehicleStatus}。
+    uint8_t ir_buf[8];
+    tlb_wb_t ir, w;
+    tlb_wb_init(&ir, ir_buf, sizeof(ir_buf));
+    tlb_wb_init(&w, out, cap);
+    if (!tlb_wb_sub(&w, 1, &ir)) { // InformationRequest 是 oneof 字段 1，空体也要写 tag+len0
+        return 0;
+    }
+    return tlb_wb_len(&w);
+}
+
 // Destination{ domain(1 oneof) | routing_address(2 oneof) }
 static bool encode_destination(tlb_wb_t *w, uint32_t field, bool has_domain, uint32_t domain,
                                const uint8_t *routing_address)
@@ -741,6 +775,60 @@ static bool decode_command_status(tlb_rb_t *r, tlb_vcsec_t *out)
     return !r->failed;
 }
 
+// ClosureStatuses{frontDriverDoor(1) frontPassengerDoor(2) rearDriverDoor(3) rearPassengerDoor(4)
+//                 rearTrunk(5) frontTrunk(6) chargePort(7) tonneau(8)}，全部 ClosureState_E。
+// state8 下标 0..7 与字段号 1..8 一一对应；未出现的字段保持调用方预置值（0=CLOSED，proto3 语义）。
+static bool decode_closure_statuses(tlb_rb_t *r, uint8_t *state8)
+{
+    uint32_t f, w;
+    while (tlb_rb_next(r, &f, &w)) {
+        if (f >= 1 && f <= 8 && w == TLB_WIRE_VARINT) {
+            uint32_t v;
+            if (!tlb_rb_u32(r, &v)) {
+                return false;
+            }
+            state8[f - 1] = (uint8_t)v;
+        } else if (!tlb_rb_skip(r, w)) {
+            return false;
+        }
+    }
+    return !r->failed;
+}
+
+// VehicleStatus{closureStatuses(1) vehicleLockState(2) vehicleSleepStatus(3) userPresence(4)
+//               detailedClosureStatus(5)} —— 只解析前三个，其余按未知字段跳过。
+static bool decode_vehicle_status(tlb_rb_t *r, tlb_vcsec_t *out)
+{
+    uint32_t f, w;
+    while (tlb_rb_next(r, &f, &w)) {
+        if (f == 1 && w == TLB_WIRE_LEN) {
+            tlb_rb_t cs;
+            if (!tlb_rb_sub(r, &cs)) {
+                return false;
+            }
+            if (!decode_closure_statuses(&cs, out->closure_state)) {
+                return false;
+            }
+            out->has_closure_status = true;
+        } else if ((f == 2 || f == 3) && w == TLB_WIRE_VARINT) {
+            uint32_t v;
+            if (!tlb_rb_u32(r, &v)) {
+                return false;
+            }
+            if (f == 2) {
+                out->vehicle_lock_state = v;
+                out->has_vehicle_lock_state = true;
+            } else {
+                out->vehicle_sleep_status = v;
+                out->has_vehicle_sleep_status = true;
+            }
+        } else if (!tlb_rb_skip(r, w)) {
+            return false;
+        }
+    }
+    return !r->failed;
+}
+
 bool tlb_msg_decode_from_vcsec(const uint8_t *data, size_t len, tlb_vcsec_t *out)
 {
     tlb_rb_t r, sub;
@@ -767,6 +855,15 @@ bool tlb_msg_decode_from_vcsec(const uint8_t *data, size_t len, tlb_vcsec_t *out
             }
             if (f == 1) {
                 out->has_vehicle_status = true;
+                // 内层解析 closureStatuses/vehicleLockState/vehicleSleepStatus。
+                // 解析失败只清新增字段：has_vehicle_status 照旧为 true，
+                // inspect/summarize 的输出文本因此逐字不变（金标准锁死）。
+                if (!decode_vehicle_status(&sub, out)) {
+                    out->has_closure_status = false;
+                    out->has_vehicle_lock_state = false;
+                    out->has_vehicle_sleep_status = false;
+                    memset(out->closure_state, 0, sizeof(out->closure_state));
+                }
             } else if (f == 16) {
                 out->has_whitelist_info = true;
             } else {

@@ -2,6 +2,12 @@
 ai-passport.zip
 .hosttest/
 
+# NVS 备份（含设备私钥与真实绑定数据，绝不入库/上架）
+nvs_backup_*.bin
+nvs-before-*.bin
+nvs-after-*.bin
+nvs-2026*.bin
+
 # 构建产物（ai-passport/.gitignore 与 tesla-ble-probe/.gitignore 已覆盖各自目录，此处兜底）
 build/
 managed_components/

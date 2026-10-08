@@ -10,6 +10,7 @@
 
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "esp_log.h"
 
 #include "tesla_core/tlb_types.h"
 #include "tesla_ble/tlb_ble.h"
@@ -34,15 +35,35 @@ static const char *slot_key_of(uint32_t slot)
 
 static nvs_handle_t s_h;
 static bool s_open;
+static bool s_flash_up;
 
 esp_err_t tlb_nvs_init(void)
 {
     if (s_open) {
         return ESP_OK;
     }
+    // NVS 分区必须先由 nvs_flash_init() 挂载，否则 nvs_open() 一律返回
+    // ESP_ERR_NVS_NOT_INITIALIZED —— 密钥、两个域 counter、NimBLE bond 全写不进去。
+    // 分区被别的应用写满 / 版本不匹配时按标准做法擦除重来（擦除后 counter 归零，
+    // 车辆侧必须重新绑卡，见上下文卡 §7.2）。
+    if (!s_flash_up) {
+        esp_err_t f = nvs_flash_init();
+        if (f == ESP_ERR_NVS_NO_FREE_PAGES || f == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+            ESP_LOGW("tlb_nvs", "NVS 分区无空页或版本不符(0x%x)，擦除后重建", f);
+            ESP_ERROR_CHECK(nvs_flash_erase());
+            f = nvs_flash_init();
+        }
+        if (f != ESP_OK) {
+            ESP_LOGE("tlb_nvs", "nvs_flash_init 失败: 0x%x", f);
+            return f;
+        }
+        s_flash_up = true;
+    }
     esp_err_t e = nvs_open(TLB_NVS_NS, NVS_READWRITE, &s_h);
     if (e == ESP_OK) {
         s_open = true;
+    } else {
+        ESP_LOGE("tlb_nvs", "nvs_open(%s) 失败: 0x%x", TLB_NVS_NS, e);
     }
     return e;
 }
@@ -267,6 +288,16 @@ bool tlb_nvs_vin_save(const char *vin)
         return false;
     }
     return nvs_commit(s_h) == ESP_OK;
+}
+
+// 出厂重置用：手输 VIN 一并清掉（普通 forget 不清，换车/清档案时它要保留）。
+void tlb_nvs_vin_clear(void)
+{
+    if (!s_open) {
+        return;
+    }
+    nvs_erase_key(s_h, "vin");
+    nvs_commit(s_h);
 }
 
 // describeBind()：new Date(t).toLocaleString() 在设备上没有对应物，

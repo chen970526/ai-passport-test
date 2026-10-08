@@ -93,12 +93,50 @@ typedef enum {
     TLB_FAULT_REQUIRES_RESPONSE_ENCRYPTION = 28
 } tlb_fault_t;
 
-// vcsec.RKEAction_E（节选）
+// vcsec.RKEAction_E（节选）—— 与 tlb_text.c 的 E_RKE 表逐条对应，缺一个就会漏白名单。
+// 探针 rke.js:KNOWN_RKE = [0,1,20,29,30]，设备侧的白名单以这五个值为准。
 enum {
     TLB_RKE_UNLOCK = 0,
     TLB_RKE_LOCK = 1,
     TLB_RKE_REMOTE_DRIVE = 20,
+    TLB_RKE_AUTO_SECURE = 29,
     TLB_RKE_WAKE_VEHICLE = 30
+};
+
+// 官方现行 RKEAction_E 里被识别的动作号；不在表内的值一律不下发（见 tlb_app.c:handle_rke）。
+static inline bool tlb_rke_action_known(int32_t action)
+{
+    return action == TLB_RKE_UNLOCK || action == TLB_RKE_LOCK ||
+           action == TLB_RKE_REMOTE_DRIVE || action == TLB_RKE_AUTO_SECURE ||
+           action == TLB_RKE_WAKE_VEHICLE;
+}
+
+// vcsec.ClosureMoveType_E（后备箱指令只用到 OPEN=3；注意与回包用的 ClosureState_E 不是一张表）
+enum {
+    TLB_CLOSURE_MOVE_NONE = 0,
+    TLB_CLOSURE_MOVE_MOVE = 1,
+    TLB_CLOSURE_MOVE_STOP = 2,
+    TLB_CLOSURE_MOVE_OPEN = 3,
+    TLB_CLOSURE_MOVE_CLOSE = 4
+};
+
+// vcsec.ClosureState_E（vehicleStatus.closureStatuses 的回包状态）
+enum {
+    TLB_CLOSURE_CLOSED = 0,
+    TLB_CLOSURE_OPEN = 1,
+    TLB_CLOSURE_AJAR = 2,
+    TLB_CLOSURE_UNKNOWN = 3,
+    TLB_CLOSURE_FAILED_UNLATCH = 4,
+    TLB_CLOSURE_OPENING = 5,
+    TLB_CLOSURE_CLOSING = 6
+};
+
+// vcsec.VehicleLockState_E（vehicleStatus.vehicleLockState；proto3 省略 0 = 解锁）
+enum {
+    TLB_VEHICLE_UNLOCKED = 0,
+    TLB_VEHICLE_LOCKED = 1,
+    TLB_VEHICLE_INTERNAL_LOCKED = 2,
+    TLB_VEHICLE_SELECTIVE_UNLOCKED = 3
 };
 
 // keys.Role（绑定时写 PermissionChange.keyRole）

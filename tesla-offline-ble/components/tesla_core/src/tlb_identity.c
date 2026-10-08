@@ -160,6 +160,51 @@ tlb_match_mode_t tlb_match_adv_name(const tlb_ble_names_t *names, const char *ad
     return TLB_MATCH_NONE;
 }
 
+bool tlb_name_looks_like_tesla(const char *adv_name)
+{
+    char compact[32];
+    size_t n_comp = 0;
+    const char *s = adv_name ? adv_name : "";
+
+    // 形状一（老款车）：'S' + 16 位十六进制 + 可选尾缀 [C/R/D/P]，长度 17/18。
+    // 广播名原文判定，不归一化（哈希名没有分隔符变体，实测定案就是紧凑形式）。
+    size_t len = strlen(s);
+    if (len == 17 || len == 18) {
+        bool ok = s[0] == 'S' || s[0] == 's';
+        for (size_t i = 1; ok && i <= 16; i++) {
+            char c = s[i];
+            bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+                       (c >= 'A' && c <= 'F');
+            if (!hex) {
+                ok = false;
+            }
+        }
+        if (ok && len == 18) {
+            char c = s[17];
+            if (c != 'C' && c != 'R' && c != 'D' && c != 'P') {
+                ok = false;
+            }
+        }
+        if (ok) {
+            return true;
+        }
+    }
+
+    // 形状二（新款车）：压缩掉所有非字母数字并转大写后 = "TESLA" + 6 位 VIN 尾号，
+    // 总长 11（兼容 "Tesla 723591" / "Tesla723591" 等分隔符变体，与探针 loose 档同思路）。
+    for (size_t i = 0; s[i] != '\0' && n_comp < sizeof(compact) - 1; i++) {
+        char c = s[i];
+        if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+            compact[n_comp++] = (c >= 'a' && c <= 'z') ? (char)(c - 'a' + 'A') : c;
+        }
+    }
+    compact[n_comp] = '\0';
+    if (n_comp == 11 && strncmp(compact, "TESLA", 5) == 0) {
+        return true; // 尾 6 位是否 VIN 由用户在列表里肉眼核对，这里只认形状
+    }
+    return false;
+}
+
 bool tlb_uuid_is_tesla_service(const char *uuid)
 {
     char nn[TLB_UUID_STR_MAX];

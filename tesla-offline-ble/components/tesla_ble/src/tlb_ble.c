@@ -199,6 +199,40 @@ static void Lend(tlb_log_kind_t kind)
 // ---------------------------------------------------------------- 错误码 → 文案
 // uni 的错都长这样：'<中文说明> errCode=<n>'；探针靠字符串判据识别属性拒绝，
 // 所以设备侧必须把 NimBLE 的 rc 也渲染成同样的形状（见 is_property_reject）。
+// SMP 错误码（Core Spec Vol 3 Part C 2.12）：BLE_HS_ERR_SM_*_BASE + 这里的小码值。
+static const char *sm_err_text(unsigned ec)
+{
+    switch (ec) {
+    case BLE_SM_ERR_PASSKEY:          return "配对失败：Passkey 输入有误";
+    case BLE_SM_ERR_OOB:              return "配对失败：OOB 数据不可用";
+    case BLE_SM_ERR_AUTHREQ:          return "车辆拒绝配对：认证要求无法满足(Authentication Requirement)";
+    case BLE_SM_ERR_CONFIRM_MISMATCH: return "配对失败：Confirm 值不匹配";
+    case BLE_SM_ERR_PAIR_NOT_SUPP:    return "车辆不支持本次配对方式";
+    case BLE_SM_ERR_ENC_KEY_SZ:       return "配对失败：加密密钥长度不合规";
+    case BLE_SM_ERR_CMD_NOT_SUPP:     return "配对失败：命令不支持";
+    case BLE_SM_ERR_UNSPECIFIED:      return "配对失败：未指定原因";
+    case BLE_SM_ERR_REPEATED:         return "配对失败：重复尝试";
+    case BLE_SM_ERR_INVAL:            return "配对失败：参数非法";
+    case BLE_SM_ERR_DHKEY:            return "配对失败：DHKey 校验不通过";
+    case BLE_SM_ERR_NUMCMP:           return "配对失败：数值比较未通过";
+    case BLE_SM_ERR_ALREADY:          return "配对已经建立";
+    case BLE_SM_ERR_CROSS_TRANS:      return "配对失败：跨传输密钥格式不支持";
+    case BLE_SM_ERR_KEY_REJ:          return "密钥被对端拒绝";
+    default:                          return NULL;
+    }
+}
+
+static void sm_rc_text(int rc, int base, const char *who, char *out, size_t cap)
+{
+    unsigned ec = (unsigned)(rc - base);
+    const char *t = sm_err_text(ec);
+    if (t) {
+        snprintf(out, cap, "%s errCode=10008", t);
+        return;
+    }
+    snprintf(out, cap, "%s SMP 错误 0x%02x errCode=10008", who, ec);
+}
+
 static void rc_text(int rc, char *out, size_t cap)
 {
     if (rc == 0) {
@@ -232,6 +266,16 @@ static void rc_text(int rc, char *out, size_t cap)
             snprintf(out, cap, "ATT 错误 0x%02x errCode=10008", att);
             return;
         }
+    }
+    // SMP 段：1283 这类「蓝牙栈错误 N」其实全在这里（0x500+0x03 = 车辆以
+    // Authentication Requirement 拒绝配对），旧版没有映射所以渲染成无意义文案。
+    if (rc >= BLE_HS_ERR_SM_PEER_BASE && rc < (BLE_HS_ERR_SM_PEER_BASE + 0x100)) {
+        sm_rc_text(rc, BLE_HS_ERR_SM_PEER_BASE, "对端（车辆）", out, cap);
+        return;
+    }
+    if (rc >= BLE_HS_ERR_SM_US_BASE && rc < (BLE_HS_ERR_SM_US_BASE + 0x100)) {
+        sm_rc_text(rc, BLE_HS_ERR_SM_US_BASE, "本机", out, cap);
+        return;
     }
     switch (rc) {
     case BLE_HS_ENOTCONN:
@@ -658,7 +702,7 @@ static tlb_ble_dev_t *adv_find_or_add(const char *id)
 //   rank = hit ? 0 : tesla ? 1 : name ? 2 : 3
 //   r    = （是数字且非 0）? rssi : -999
 //   比较 = rank 升序 || r 降序 || name localeCompare
-// DEFER: localeCompare 换 strcmp —— 名字全是 ASCII（Tesla 723591 / S+16hex），
+// DEFER: localeCompare 换 strcmp —— 名字全是 ASCII（Tesla 000000 / S+16hex），
 // 只有车主塞进中文时才可能与 ICU 排序不同，不影响选车。
 static int adv_rank(const tlb_ble_dev_t *e)
 {
@@ -1042,7 +1086,12 @@ static void on_disc_report(struct ble_gap_event *event)
         if (s_scan_found) {
             return;
         }
-        if (memcmp(event->disc.addr.val, s_scan_addr, 6) != 0 ||
+        if (memcmp(event->disc.addr.val, s_scan_addr, 6) != 0) {
+            return;
+        }
+        // TLB_BLE_ADDR_TYPE_ANY：只认 MAC，不认地址类型（真机实测车辆用公共地址，
+        // 写死类型会让这条定向扫描永远不命中）
+        if (s_scan_addr_type != TLB_BLE_ADDR_TYPE_ANY &&
             event->disc.addr.type != s_scan_addr_type) {
             return;
         }
@@ -1138,7 +1187,10 @@ static void on_disc_report(struct ble_gap_event *event)
                 : TLB_MATCH_NONE;
         copy_str(rec->name, sizeof(rec->name), name, strlen(name));
         rec->rssi = event->disc.rssi;
-        rec->tesla = tesla || rec->tesla;
+        // 特斯拉判定三路：广播带 VCSEC 服务 UUID / 老款哈希名形状 / 新款 Tesla+尾号形状。
+        // 引导扫描传 names=NULL（还不知道用户 VIN），UUID 不在广播包里的老款车
+        // 只能靠名字形状认出来，否则引导列表永远扫不到它（fw36 实测修复）。
+        rec->tesla = tesla || rec->tesla || tlb_name_looks_like_tesla(name);
         memcpy(rec->addr, event->disc.addr.val, 6);
         rec->addr_type = event->disc.addr.type;
         rec->valid = true;
@@ -1238,7 +1290,7 @@ static int gap_cb(struct ble_gap_event *event, void *arg)
             if (s_sec_pending) {
                 int rc = ble_gap_security_initiate(event->connect.conn_handle);
                 if (rc != 0) {
-                    char t[64];
+                    char t[160]; // SMP 拒绝的中文文案比 ATT/HCI 的长（最长约 90 字节），64 会截断
                     rc_text(rc, t, sizeof(t));
                     s_sec_done = true;
                     xSemaphoreGive(s_sec_sem);
@@ -1262,7 +1314,7 @@ static int gap_cb(struct ble_gap_event *event, void *arg)
             Lput("配对/加密已完成（bond 已保留到 NVS）");
             Lend(TLB_LOG_OK);
         } else {
-            char t[64];
+            char t[160]; // 同上：SMP 拒绝文案需要 >64 字节才不被截断
             rc_text(event->enc_change.status, t, sizeof(t));
             Lput("配对/加密未成功: ");
             Lput(t);
@@ -1348,12 +1400,13 @@ esp_err_t tlb_ble_stack_start(void)
     if (s_stack_up) {
         return ESP_OK;
     }
-    // 首选 MTU 先钉到最高档，之后每档试探时再降（对应 uni 的 setBLEMTU 阶梯）
-    ble_att_set_preferred_mtu(517);
     if (nimble_port_init() != ESP_OK) {
         tlb_ble_log(TLB_LOG_ERROR, "蓝牙栈初始化失败（NimBLE host 起不来）");
         return ESP_FAIL;
     }
+    // 首选 MTU 先钉到最高档，之后每档试探时再降（对应 uni 的 setBLEMTU 阶梯）。
+    // 必须在 nimble_port_init() 之后调用：此前 NPL 函数表未就绪，ble_hs_lock() 会空指针崩溃。
+    ble_att_set_preferred_mtu(517);
     ble_hs_cfg.sync_cb = on_host_sync;
     ble_hs_cfg.reset_cb = on_host_reset;
     // TIB：配对能力。车辆是 NoInputNoOutput，所以 mitm 必须留 0（置 1 会让 SM 判定
@@ -1491,7 +1544,7 @@ int tlb_ble_scan_mac(const char *mac, uint8_t addr_type, int64_t timeout_ms, tlb
         return -1;
     }
     if (!id_to_addr(mac, s_scan_addr)) {
-        set_str(err, err_cap, "MAC 地址不合法（要 84:16:5C:75:51:B9 这种形式）");
+        set_str(err, err_cap, "MAC 地址不合法（要 AA:BB:CC:DD:EE:FF 这种形式）");
         return -1;
     }
     s_scan_addr_type = addr_type;
@@ -1992,6 +2045,11 @@ bool tlb_ble_connect(const tlb_ble_dev_t *dev, char *err, size_t err_cap)
         peer.val[i] = dev->addr[i];
     }
     memset(&params, 0, sizeof(params));
+    // 连接过程中的扫描参数（0.625ms 单位）。Espressif 控制器要求二者落在 0x0004~0x4000
+    // 且 window<=itvl，留 0 会在 LE_Create_Connection 上直接回 BLE_ERR_INV_HCI_CMD_PARMS，
+    // 所以这里必须显式给值（与 discover() 用的 itvl/window 取同一档，扫描更积极）。
+    params.scan_itvl = 0x0120;        // 112 * 0.625 = 70ms
+    params.scan_window = 0x0060;      // 60 * 0.625 = 37.5ms
     params.itvl_min = 36;             // 45ms
     params.itvl_max = 72;             // 90ms
     params.latency = 0;

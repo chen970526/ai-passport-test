@@ -145,7 +145,7 @@ static void test_gcm(const tlb_g_gcm *c) {
 }
 
 // ---------------------------------------------------------------- 协议层公共断言
-#define TEST_VIN "LRWYGCEJ0TC723591"
+#define TEST_VIN "5YJ3E1EA7KF000000" // 假 VIN 夹具（上架脱敏：绝不用真实车辆 VIN）
 
 static void chk(const char *name, long long got, long long want) {
     g_checks++;
@@ -1705,6 +1705,34 @@ static void test_identity(void) {
         none[0] = NULL;
         none[1] = c->uuid;
         chk_b(c->name, "list_null_first", tlb_has_tesla_service(none, 2), c->hit);
+    }
+
+    // 引导列表形状识别（fw36 修复老款哈希名车扫不进列表的回归锁）
+    {
+        static const struct {
+            const char *name;
+            const char *case_name;
+            bool want;
+        } shape_cases[] = {
+            { "S0123456789abcdefC", "hash_old_suffix_C", true },   // 老款：S+16hex+尾缀（合成值，禁真名）
+            { "See13c959535a3b7d", "hash_no_suffix", true },       // 老款：S+16hex 无尾缀（假VIN夹具）
+            { "SEE13C959535A3B7DP", "hash_upper_P", true },        // 大写 hex + 尾缀 P
+            { "Tesla 000000", "new_with_space", true },            // 新款：Tesla+空格+6位
+            { "Tesla000000", "new_no_space", true },               // 新款变体：无空格
+            { "tesla-000000", "new_dash_lower", true },            // 分隔符变体
+            { "midea38:2F:B0", "midea", false },                   // 随机家电
+            { "CFMOTO-072668", "cfmoto", false },                  // 随机车机
+            { "S0123456789abcde", "hash_15hex", false },           // 只有 15 位 hex
+            { "S0123456789abcdefZ", "hash_bad_suffix", false },    // 尾缀不在 CRDP 内
+            { "X0123456789abcdefC", "bad_head", false },           // 头字母不是 S
+            { "Tesla 00000", "new_5digits", false },               // 尾号不足 6 位
+            { "", "empty", false },
+            { NULL, "null", false },
+        };
+        for (i = 0; i < (int)(sizeof(shape_cases) / sizeof(shape_cases[0])); i++) {
+            chk_b(shape_cases[i].case_name, "shape",
+                  tlb_name_looks_like_tesla(shape_cases[i].name), shape_cases[i].want);
+        }
     }
 
     for (i = 0; i < TLB_G_N(g_cap_cases); i++) {

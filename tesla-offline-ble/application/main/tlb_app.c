@@ -11,7 +11,8 @@
 //   1) 把 core 的返回文本按探针「调用方侧」的日志形状打出来
 //      （V3 会话已就绪：/ 结果 OK·ERROR 行 / 自动重连那一整套）；
 //   2) 密钥、会话、绑定档案的落盘与恢复（探针 store 层的等价物）；
-//   3) 自动重连退避循环（3→6→12→24→30 秒），对应 auto-reconnect.js 的定时器群。
+//   3) 自动重连轮询循环 —— 车钥匙形态下固定 2 秒一轮（电量优先，不再退避升档），
+//      对应 auto-reconnect.js 定时器群的等价物。
 //
 // 已知偏离（都是设备形态差异，不是行为差异）：
 //   · 无绑定档案时按内置目标车辆播种（MAC/VIN 硬编码）—— 裸机没有手输 VIN 的界面。
@@ -34,6 +35,7 @@
 #include "freertos/queue.h"
 
 #include "esp_err.h"
+#include "esp_system.h" // esp_restart（出厂重置）
 
 #include "tesla_ble/tlb_ble.h"
 
@@ -47,19 +49,17 @@
 #include "tesla_core/tlb_types.h"
 #include "tesla_core/tlb_v3.h"
 
-// ---------------------------------------------------------------- 目标车辆与节奏
-// 设备侧没有手输 VIN 的入口，内置唯一目标车（与探针现场测试的是同一台）。
-#define TLB_TARGET_VIN "LRW3E7F35N0008186"
-#define TLB_TARGET_MAC "84:16:5C:75:51:B9"
-#define TLB_TARGET_ADDR_TYPE 1u // 车辆广播用的是随机静态地址，类型必须是 1
-
-#define TLB_SCAN_TIMEOUT_MS 20000LL // config/index.js:SCAN_TIMEOUT_MS
-#define TLB_AUTO_SCAN_MS 10000LL    // config/index.js:AUTO_RECONNECT_SCAN_MS
+// ---------------------------------------------------------------- 节奏
+// 不再内置「目标车辆」常量：真机验证过的车与早期写死的 MAC/地址类型都不符，
+// 按常量播种档案会把别辆车的身份写进 NVS。身份一律来自 NVS（档案 + 手输 VIN）。
+#define TLB_SCAN_TIMEOUT_MS 20000LL // config/index.js:SCAN_TIMEOUT_MS（手动 scan 命令仍用长窗口）
+// 车钥匙形态：轮询节奏由用户定为「约 2 秒一次」。扫描窗口跟着缩到 2 秒 ——
+// 保持 10 秒窗口的话一轮尝试就要 20 秒，2 秒重试间隔形同虚设，且休眠期蓝牙几乎常开更费电。
+// 实车实测开机 0.3 秒就按 MAC 命中广播，2 秒窗口足够。
+#define TLB_AUTO_SCAN_MS 2000LL     // 自动轮询每轮的两个扫描窗口（定向 + 全量）
+#define TLB_RETRY_DELAY_MS 2000LL   // 一轮没连上之后固定再等 2 秒（替代退避升档）
 #define TLB_APP_ADV_MAX 24          // 一轮扫描最多记 24 条（notfound 文案只用前 8 条）
 #define TLB_APP_CMD_Q_LEN 16
-
-// config/index.js:RETRY_STEPS_MS —— 只有自动重试升档，手动触发和断线重连归零重来
-static const int64_t k_retry_steps_ms[5] = {3000, 6000, 12000, 24000, 30000};
 
 // ---------------------------------------------------------------- 字符串拼接器
 // 探针里全是 JS 的 + 拼接；C 侧用这个保证「句式逐字一致」而不用手写一串 strcat。
@@ -117,6 +117,34 @@ static char s_vin[TLB_VIN_MAX];       // 对应 state.vin（手输 / 档案回�
 static tlb_profile_t s_profile;       // 对应 bind-profile.js 的 bind 对象
 static SemaphoreHandle_t s_state_mtx;
 
+// —— 首次绑定引导（社区版自助开箱：全程不输 VIN）——
+// 无密钥或无绑定档案时自动进入：10 秒一轮全量扫描（带 0211 服务或广播名以
+// "Tesla " 开头即收）→ 屏幕 5 行列表手选 → 连接（新固件车广播名 "Tesla XXXXXX"
+// 直接得到 VIN 后 6 位；哈希名/改名车用占位 VIN 过绑定守卫，VCSEC 会话按公钥
+// 走不受影响，档案 VIN 留空、回连按 MAC）→ 自动发加钥匙请求 → 车主刷 NFC 卡
+// 授权 → 落盘档案回首页。屏幕渲染在 key_ui.c，数据走 tlb_app_ui_snapshot。
+#define TLB_ONB_SCAN_MS 10000LL // 引导扫描单轮窗口（坐车内 10 秒足够收齐周边广播）
+static portMUX_TYPE s_onb_mux = portMUX_INITIALIZER_UNLOCKED;
+static struct {
+    uint8_t stage; // tlb_onb_stage_t
+    uint8_t count; // 本页行数
+    uint8_t cursor; // 本页内光标行
+    uint8_t total;  // 全部条数
+    uint8_t page;   // 当前页（0 起）
+    uint8_t pages;  // 总页数
+    int64_t at;
+    char note[TLB_ONB_NOTE_MAX];
+    tlb_onb_item_t list[TLB_ONB_LIST_MAX];
+} s_onb_pub;                      // worker 写 / LVGL 读，整块拷贝时进临界区
+static bool s_onb_active;         // 引导模式总开关（绑定成功后 worker 延时关闭）
+static volatile int s_onb_cursor; // 光标真值（按键任务写，worker 读）
+static tlb_ble_dev_t s_onb_raw[TLB_APP_ADV_MAX]; // 引导扫描原始记录仓（worker 专用，
+                                                 // SELECT 连接时要用原始地址字节）
+static tlb_onb_item_t s_onb_items[TLB_APP_ADV_MAX]; // 排序后的全量条目（worker 读写；
+                                                 // 按键任务只动 s_onb_cursor 这个 int）
+static int s_onb_raw_idx[TLB_APP_ADV_MAX];       // 条目 m ← 原始记录 s_onb_raw[idx[m]]
+static int s_onb_n;                              // 条目总数（一屏装不下靠翻页）
+
 // core 调用的结果对象：worker 串行使用，静态分配防栈溢出
 static tlb_handshake_result_t s_hr;
 static tlb_request_result_t s_rr;
@@ -133,14 +161,39 @@ static QueueHandle_t s_cmd_q;
 static SemaphoreHandle_t s_link_wake; // 计数信号量：唤醒链路任务立刻跑一轮
 
 // 自动重连循环状态 —— auto-reconnect.js 的 loopWanted/loopTimer/loopNextAt/loopRun/
-// loopStep/loopTries 与 autoSuspended。C 里 loopTimer 退化成「next_at 是否非零」。
+// loopTries 与 autoSuspended。C 里 loopTimer 退化成「next_at 是否非零」。
+// loopStep（退避档位）在车钥匙形态下没有意义：间隔恒为 TLB_RETRY_DELAY_MS，已删。
 static volatile bool s_loop_wanted;
 static volatile bool s_auto_suspended;
-static volatile int s_loop_step;
 static volatile int s_loop_tries;
 static volatile int64_t s_loop_next_at;
 static volatile bool s_link_run; // 单飞：同一时刻最多一轮尝试
 static volatile bool s_link_due; // 「立刻试一次」的请求位
+
+// UI 快照（key_ui.c 每个心跳轮询）：屏幕只读这几个量，不碰任何 BLE 状态机。
+static volatile bool s_ever_connected;   // 开机以来是否连上过（决定还显不显开机动画）
+static volatile int32_t s_rke_action = -1; // 最近一次 RKE 动作号，-1 = 开机后没发过
+static volatile bool s_rke_pending;      // 发出后还没拿到回执
+static volatile bool s_rke_ok;           // 最近一次 RKE 是否被车端受理
+static volatile int64_t s_rke_at;        // 最近一次 RKE 置位时刻（UI 用它做 3 秒回执窗口）
+static volatile bool s_has_status;       // 收到过 vehicleStatus（屏幕画车态的前提）
+static volatile uint8_t s_closure[8];    // ClosureState_E ×8（前左…卷盖板）
+static volatile uint8_t s_lock_state;    // VehicleLockState_E：0=解锁 1=上锁
+static volatile bool s_fac_reset;        // 出厂重置进行中（UI 显示重置提示直到重启）
+
+// 把一帧 FromVCSECMessage 里的 vehicleStatus 刷进 UI 快照。
+// 只有 closureStatuses 在才算「状态可用」；vehicleLockState 缺失按解锁（proto3 省略 0）。
+static void apply_vehicle_status(const tlb_vcsec_t *v)
+{
+    if (!v->has_vehicle_status || !v->has_closure_status) {
+        return;
+    }
+    for (int i = 0; i < 8; i++) {
+        s_closure[i] = v->closure_state[i];
+    }
+    s_lock_state = v->has_vehicle_lock_state ? (uint8_t)v->vehicle_lock_state : 0;
+    s_has_status = true;
+}
 
 static void lock_state(void) { xSemaphoreTake(s_state_mtx, portMAX_DELAY); }
 static void unlock_state(void) { xSemaphoreGive(s_state_mtx); }
@@ -474,20 +527,23 @@ static void load_profile(void)
         sb_log(TLB_LOG_INFO, &sb);
         return;
     }
-    // 偏离（设备侧专有）：裸机没有手输 VIN 的界面，按内置目标车播种一份档案
-    memset(&s_profile, 0, sizeof(s_profile));
-    tlb_profile_t seed;
-    memset(&seed, 0, sizeof(seed));
-    snprintf(seed.id, sizeof(seed.id), "%s", TLB_TARGET_MAC);
-    snprintf(seed.vin, sizeof(seed.vin), "%s", TLB_TARGET_VIN);
-    tlb_nvs_profile_save(&seed);
-    tlb_nvs_profile_load(&s_profile);
+    // 没有档案：只把 NVS 里手输过的 VIN 灌回内存，绝不播种一份「内置目标车」的假身份
+    // （旧做法会把别辆车的 MAC/VIN 写进 NVS，污染 active_vin() 与广播名匹配）。
+    if (!s_vin[0]) {
+        tlb_nvs_vin_load(s_vin, sizeof(s_vin));
+    }
     char msg[640];
     tlb_sb_t sb;
     sb_init(&sb, msg, sizeof(msg));
-    sb_puts(&sb, "未找到绑定档案，按内置目标车辆播种：");
-    sb_puts(&sb, TLB_TARGET_MAC);
-    sb_puts(&sb, "（设备侧专有）");
+    sb_puts(&sb, "未找到绑定档案");
+    if (s_vin[0]) {
+        sb_puts(&sb, "，本机记录的 VIN=");
+        sb_puts(&sb, s_vin);
+        sb_puts(&sb, "；");
+    } else {
+        sb_puts(&sb, "，本机还没有 VIN；");
+    }
+    sb_puts(&sb, "先 scan 列出车辆，再 connect <VIN> 连一次");
     sb_log(TLB_LOG_INFO, &sb);
 }
 
@@ -500,10 +556,10 @@ static bool connect_and_record(const char *vin, const tlb_ble_dev_t *dev, char *
         return false;
     }
     invalidate_all("换了连接，共享密钥随本次会话失效");
-    // hooks.onConnected：连上 = 用户就在车边，暂停标记与退避档一起清零
+    // hooks.onConnected：连上 = 用户就在车边，暂停标记与尝试计数一起清零
     s_auto_suspended = false;
-    s_loop_step = 0;
     s_loop_tries = 0;
+    s_ever_connected = true; // UI：开机动画到此结束
 
     tlb_profile_t patch;
     memset(&patch, 0, sizeof(patch));
@@ -515,6 +571,8 @@ static bool connect_and_record(const char *vin, const tlb_ble_dev_t *dev, char *
     snprintf(patch.name, sizeof(patch.name), "%s", dev->name);
     patch.connected_at = tlb_port_now_ms();
     save_bind(&patch);
+    // 连上 = 连接边沿：排一条状态查询，屏幕的俯视车形尽早拿到第一帧 vehicleStatus
+    tlb_app_post(TLB_CMD_STATUS_QUERY, 0);
     return true;
 }
 
@@ -536,6 +594,10 @@ static void auto_skip(auto_res_t *res, const char *reason, const char *text)
 static void auto_once(auto_res_t *res)
 {
     memset(res, 0, sizeof(*res));
+    if (s_onb_active) {
+        auto_skip(res, "onb", "首次绑定引导进行中，自动重连挂起");
+        return;
+    }
     if (!op_has_key(NULL)) {
         auto_skip(res, "nokey", "本机还没有密钥，先走「③ 绑定（刷钥匙卡）」");
         return;
@@ -565,9 +627,11 @@ static void auto_once(auto_res_t *res)
     char err[160];
 
     // 1. 先按档案里的 deviceId 直连（设备侧 = 先扫该 MAC 再连）
+    // 地址类型不能写死：真机实测本车广播用的是公共地址（type=0），
+    // 早期固定按 type=1 过滤导致这条定向扫描永不命中，每轮都白等一次再退回全量扫描。
     if (s_profile.id[0]) {
         tlb_ble_dev_t dev;
-        int rc = tlb_ble_scan_mac(s_profile.id, TLB_TARGET_ADDR_TYPE, TLB_AUTO_SCAN_MS, &dev, err,
+        int rc = tlb_ble_scan_mac(s_profile.id, TLB_BLE_ADDR_TYPE_ANY, TLB_AUTO_SCAN_MS, &dev, err,
                                   sizeof(err));
         bool connected = false;
         bool failed = false;
@@ -706,18 +770,12 @@ static void auto_once(auto_res_t *res)
     }
 }
 
-// ---------------------------------------------------------------- 退避循环
-// auto-reconnect.js:armRetry —— 先取档再升档；loopTimer 在 C 里退化成 next_at
+// ---------------------------------------------------------------- 轮询排期
+// 车钥匙形态：不再照搬 auto-reconnect.js 的退避升档，间隔恒为 2 秒。
 static int64_t arm_retry(void)
 {
-    int st = s_loop_step;
-    if (st > 4) {
-        st = 4;
-    }
-    int64_t delay = k_retry_steps_ms[st];
-    s_loop_step = st + 1;
-    s_loop_next_at = tlb_port_now_ms() + delay;
-    return delay;
+    s_loop_next_at = tlb_port_now_ms() + TLB_RETRY_DELAY_MS;
+    return TLB_RETRY_DELAY_MS;
 }
 
 // auto-reconnect.js:stopAutoReconnectLoop —— 幂等门槛逐字对齐；
@@ -753,7 +811,6 @@ static void run_once(void)
         return;
     }
     if (r.ok || strcmp(r.skipped, "already") == 0) {
-        s_loop_step = 0;
         return;
     }
     if (strcmp(r.skipped, "nokey") == 0 || strcmp(r.skipped, "nobind") == 0) {
@@ -815,7 +872,6 @@ static void link_task(void *arg)
         snprintf(prev, sizeof(prev), "%s", st);
         if (now_disc && !was_disc) { // hooks.onLinkLost
             if (s_loop_wanted && !s_auto_suspended) {
-                s_loop_step = 0;
                 s_loop_tries = 0;
                 run_attempt();
             }
@@ -834,7 +890,6 @@ static void start_loop(void)
 {
     s_loop_wanted = true;
     if (!s_link_run) {
-        s_loop_step = 0;
         s_loop_tries = 0;
     }
     s_link_due = true;
@@ -899,17 +954,35 @@ static void handle_rke(int32_t action, const char *vin)
 {
     char lbl[64];
     tlb_label(TLB_EN_RKE, (uint32_t)action, lbl, sizeof(lbl));
-    // rke.js:KNOWN_RKE = [0,1,20,29,30]（tlb_types.h 的枚举缺 29，这里用字面量）
-    if (action != 0 && action != 1 && action != 20 && action != 29 && action != 30) {
+    // 白名单闸门（rke.js:KNOWN_RKE = [0,1,20,29,30]）：表外的动作号一律不下发。
+    // 真机曾因「把 20 当成上锁」误发过一条 REMOTE_DRIVE，只 WARN 不拦是错的。
+    if (!tlb_rke_action_known(action)) {
         char msg[256];
         tlb_sb_t sb;
         sb_init(&sb, msg, sizeof(msg));
         sb_puts(&sb, lbl);
-        sb_puts(&sb, "：官方现行 RKEAction_E 里没有这个值，车辆多半会拒");
-        sb_log(TLB_LOG_WARN, &sb);
+        sb_puts(&sb, "：不在官方现行 RKEAction_E 白名单（0/1/20/29/30）内，已拒绝下发");
+        sb_log(TLB_LOG_ERROR, &sb);
+        return;
     }
     uint8_t payload[16];
     size_t pn = tlb_msg_encode_rke((uint32_t)action, payload, sizeof(payload));
+    // UI：先置「发送中」，回执到了再翻 ok/fail —— 屏幕靠这几个量画回执文案
+    s_rke_action = action;
+    s_rke_pending = true;
+    s_rke_ok = false;
+    s_rke_at = tlb_port_now_ms();
+    // 审计行：把「即将下发的动作名 + 明文帧字节」显式打出来，便于事后逐条核对
+    char msg[256];
+    tlb_sb_t sb;
+    sb_init(&sb, msg, sizeof(msg));
+    sb_puts(&sb, "即将下发 ");
+    sb_puts(&sb, lbl);
+    sb_puts(&sb, " 明文=");
+    for (size_t i = 0; i < pn; i++) {
+        sb_printf(&sb, "%02x", payload[i]);
+    }
+    sb_log(TLB_LOG_INFO, &sb);
     tlb_request_t req;
     memset(&req, 0, sizeof(req));
     memset(&s_rr, 0, sizeof(s_rr));
@@ -921,7 +994,81 @@ static void handle_rke(int32_t action, const char *vin)
     req.max_ms = 0; // <=0 → core 用 TLB_DEFAULT_MAX_MS
     req.done = TLB_DONE_COMMAND;
     tlb_send_request(&req, &s_sess[0], &s_ops, &s_scratch, &s_rr);
+    s_rke_pending = false;
+    s_rke_ok = s_rr.ok;
+    s_rke_at = tlb_port_now_ms();
     sb_log(s_rr.ok ? TLB_LOG_OK : TLB_LOG_ERROR, &(tlb_sb_t){s_rr.text, strlen(s_rr.text) + 1, 0});
+    // done=TLB_DONE_COMMAND 下 RKE 的终止帧就是 vehicleStatus（没有 commandStatus 的那帧），
+    // 直接从终帧取车态入快照；再补排一条查询兜底（车辆只回 commandStatus 时快照也能刷新）。
+    apply_vehicle_status(&s_rr.obj);
+    tlb_app_post(TLB_CMD_STATUS_QUERY, 0);
+}
+
+// 开后备箱：UnsignedMessage{closureMoveRequest}，与 handle_rke 同形状走 VCSEC 域。
+// lid 0=前备箱 1=后备箱；不过 RKE 白名单闸门（那是动作号的事），屏幕用 100/101 两个私有号段。
+static void handle_lid(int32_t lid, const char *vin)
+{
+    const char *lbl = (lid == 0) ? "前备箱开启" : "后备箱开启";
+    uint8_t payload[16];
+    size_t pn = tlb_msg_encode_closure(lid, payload, sizeof(payload));
+    // UI：先置「发送中」，回执到了再翻 ok/fail —— 屏幕靠这几个量画回执文案
+    s_rke_action = (lid == 0) ? 100 : 101;
+    s_rke_pending = true;
+    s_rke_ok = false;
+    s_rke_at = tlb_port_now_ms();
+    // 审计行：与 handle_rke 同款，把「即将下发的动作名 + 明文帧字节」显式打出来
+    char msg[256];
+    tlb_sb_t sb;
+    sb_init(&sb, msg, sizeof(msg));
+    sb_puts(&sb, "即将下发 ");
+    sb_puts(&sb, lbl);
+    sb_puts(&sb, " 明文=");
+    for (size_t i = 0; i < pn; i++) {
+        sb_printf(&sb, "%02x", payload[i]);
+    }
+    sb_log(TLB_LOG_INFO, &sb);
+    tlb_request_t req;
+    memset(&req, 0, sizeof(req));
+    memset(&s_rr, 0, sizeof(s_rr));
+    req.name = lbl;
+    req.domain = TLB_DOMAIN_VCSEC;
+    req.vin = vin;
+    req.payload = payload;
+    req.payload_len = pn;
+    req.max_ms = 0; // <=0 → core 用 TLB_DEFAULT_MAX_MS
+    req.done = TLB_DONE_COMMAND;
+    tlb_send_request(&req, &s_sess[0], &s_ops, &s_scratch, &s_rr);
+    s_rke_pending = false;
+    s_rke_ok = s_rr.ok;
+    s_rke_at = tlb_port_now_ms();
+    sb_log(s_rr.ok ? TLB_LOG_OK : TLB_LOG_ERROR, &(tlb_sb_t){s_rr.text, strlen(s_rr.text) + 1, 0});
+    apply_vehicle_status(&s_rr.obj);
+    tlb_app_post(TLB_CMD_STATUS_QUERY, 0);
+}
+
+// 查询车辆状态：InformationRequest(GET_STATUS) 明文 oneof，车辆回一条 vehicleStatus。
+// 纯后台刷新，没有回执文案；未连接直接跳过（轮询背景不该刷屏报错）。
+static void handle_status_query(const char *vin)
+{
+    if (!tlb_ble_connected()) {
+        return;
+    }
+    uint8_t payload[16];
+    size_t pn = tlb_msg_encode_status_query(payload, sizeof(payload));
+    tlb_request_t req;
+    memset(&req, 0, sizeof(req));
+    memset(&s_rr, 0, sizeof(s_rr));
+    req.name = "查询车辆状态";
+    req.domain = TLB_DOMAIN_VCSEC;
+    req.vin = vin;
+    req.payload = payload;
+    req.payload_len = pn;
+    req.max_ms = 0;
+    req.done = TLB_DONE_COMMAND;
+    tlb_send_request(&req, &s_sess[0], &s_ops, &s_scratch, &s_rr);
+    apply_vehicle_status(&s_rr.obj);
+    sb_log(s_rr.ok ? TLB_LOG_INFO : TLB_LOG_ERROR,
+           &(tlb_sb_t){s_rr.text, strlen(s_rr.text) + 1, 0});
 }
 
 // enrollment-service.js:bindKey —— 探针的 mustConnect() 在 ensureKey 之前，
@@ -951,6 +1098,232 @@ static void handle_bind(const char *vin)
     if (s_br.ok && s_br.paired) {
         mark_bound();
     }
+}
+
+// ---------------------------------------------------------------- 首次绑定引导
+// 阶段/附注发布器：worker 调用。note 先在栈上定稿再进临界区，拷贝用定长 memcpy。
+static void onb_publish(uint8_t stage, const char *note)
+{
+    char buf[TLB_ONB_NOTE_MAX];
+    buf[0] = '\0';
+    if (note != NULL) {
+        snprintf(buf, sizeof(buf), "%s", note);
+    }
+    portENTER_CRITICAL(&s_onb_mux);
+    s_onb_pub.stage = stage;
+    s_onb_pub.at = tlb_port_now_ms();
+    memcpy(s_onb_pub.note, buf, sizeof(s_onb_pub.note));
+    s_onb_pub.cursor = (uint8_t)(s_onb_cursor % TLB_ONB_LIST_MAX);
+    portEXIT_CRITICAL(&s_onb_mux);
+}
+
+// 发布当前页窗口：s_onb_items[page*5 .. +5) → 快照。总数/页码一并带上，
+// 一屏装不下的设备靠右一/右二跨页移动光标自动翻页。
+static void onb_publish_window(void)
+{
+    int n = s_onb_n;
+    int c = s_onb_cursor;
+    if (c < 0) {
+        c = 0;
+    }
+    if (c > n - 1) {
+        c = n > 0 ? n - 1 : 0;
+    }
+    int page = c / TLB_ONB_LIST_MAX;
+    int start = page * TLB_ONB_LIST_MAX;
+    int rows = n - start;
+    if (rows > TLB_ONB_LIST_MAX) {
+        rows = TLB_ONB_LIST_MAX;
+    }
+    portENTER_CRITICAL(&s_onb_mux);
+    s_onb_pub.count = (uint8_t)(rows > 0 ? rows : 0);
+    s_onb_pub.total = (uint8_t)(n > 255 ? 255 : n);
+    s_onb_pub.page = (uint8_t)page;
+    s_onb_pub.pages = (uint8_t)((n + TLB_ONB_LIST_MAX - 1) / TLB_ONB_LIST_MAX);
+    s_onb_pub.cursor = (uint8_t)(c - start);
+    for (int i = 0; i < TLB_ONB_LIST_MAX; i++) {
+        s_onb_pub.list[i] = (i < rows) ? s_onb_items[start + i] : (tlb_onb_item_t){0};
+    }
+    portEXIT_CRITICAL(&s_onb_mux);
+}
+
+// 连接/绑定进行中不接受重扫与重复选择，避免打断加钥匙的时序窗口
+static bool onb_busy(void)
+{
+    portENTER_CRITICAL(&s_onb_mux);
+    uint8_t st = s_onb_pub.stage;
+    portEXIT_CRITICAL(&s_onb_mux);
+    return st == TLB_ONB_CONNECTING || st == TLB_ONB_PAIRING;
+}
+
+// 引导扫描一轮。全量列出附近设备（改名车/怪名车也能被用户认出来手动选），
+// 排序照抄探针 sortAdv：疑似特斯拉 → 有名 → 无名，同级 RSSI 强者优先。
+// 疑似判据（rec->tesla，设备层置位）：广播带 VCSEC 服务 UUID，或名字形状命中
+// tlb_name_looks_like_tesla（老款哈希名 / 新款 Tesla+尾号）。屏幕青色高亮它。
+static int onb_rank(const tlb_ble_dev_t *d)
+{
+    if (d->tesla) {
+        return 0;
+    }
+    return d->name[0] != '\0' ? 1 : 2;
+}
+
+static void handle_onb_rescan(void)
+{
+    if (!s_onb_active) {
+        return;
+    }
+    if (onb_busy()) {
+        tlb_ble_log(TLB_LOG_WARN, "引导：正在连接或等待刷卡，忽略重扫");
+        return;
+    }
+    onb_publish(TLB_ONB_SCAN, NULL);
+    char err[160];
+    int n = tlb_ble_discover(TLB_ONB_SCAN_MS, NULL, s_onb_raw, TLB_APP_ADV_MAX, err, sizeof(err));
+    if (!s_onb_active) {
+        return; // 扫描期间引导被关闭（绑定完成/清档案），别把旧列表发出去
+    }
+    int m = 0;
+    for (int i = 0; i < n && m < TLB_APP_ADV_MAX; i++) {
+        if (!s_onb_raw[i].valid) {
+            continue;
+        }
+        snprintf(s_onb_items[m].name, sizeof(s_onb_items[m].name), "%s", s_onb_raw[i].name);
+        snprintf(s_onb_items[m].id, sizeof(s_onb_items[m].id), "%s", s_onb_raw[i].id);
+        s_onb_items[m].rssi = s_onb_raw[i].rssi;
+        s_onb_items[m].tesla = s_onb_raw[i].tesla;
+        s_onb_raw_idx[m] = i;
+        m++;
+    }
+    // 插入排序（档位升序、同级 RSSI 降序）：m<=24，O(m^2) 无所谓，稳排保 RSSI 同值稳定
+    for (int i = 1; i < m; i++) {
+        tlb_onb_item_t it = s_onb_items[i];
+        int ri = s_onb_raw_idx[i];
+        int rank_i = onb_rank(&s_onb_raw[ri]);
+        int j = i - 1;
+        while (j >= 0) {
+            int rj = onb_rank(&s_onb_raw[s_onb_raw_idx[j]]);
+            bool after = rj > rank_i || (rj == rank_i && s_onb_items[j].rssi < it.rssi);
+            if (!after) {
+                break;
+            }
+            s_onb_items[j + 1] = s_onb_items[j];
+            s_onb_raw_idx[j + 1] = s_onb_raw_idx[j];
+            j--;
+        }
+        s_onb_items[j + 1] = it;
+        s_onb_raw_idx[j + 1] = ri;
+    }
+    s_onb_n = m;
+    s_onb_cursor = 0; // 新一轮列表光标回到第一行（最可能是车的那台）
+    onb_publish_window();
+    if (m > 0) {
+        int nt = 0;
+        for (int i = 0; i < m; i++) {
+            if (s_onb_items[i].tesla) {
+                nt++;
+            }
+        }
+        char msg[96];
+        tlb_sb_t sb;
+        sb_init(&sb, msg, sizeof(msg));
+        sb_printf(&sb, "引导：列出 %d 台设备（%d 台疑似特斯拉），等用户选车", m, nt);
+        sb_log(TLB_LOG_INFO, &sb);
+        onb_publish(TLB_ONB_LIST, NULL);
+        return;
+    }
+    onb_publish(TLB_ONB_NOFOUND, NULL);
+    tlb_ble_log(TLB_LOG_WARN, "引导：没扫到任何设备，2 秒后自动重扫（坐进车内唤醒车机再试）");
+    tlb_app_post(TLB_CMD_ONB_RESCAN, 0); // worker 出列再排下一轮，选车命令能插进来
+}
+
+// 从广播名提取 VIN 后 6 位（实测：新固件车广播名固定 "Tesla " + VIN 后 6 位）
+static bool onb_vin6_of(const char *name, char *out6)
+{
+    size_t n = strlen(name);
+    if (n >= 12 && strncmp(name, "Tesla ", 6) == 0) {
+        memcpy(out6, name + 6, 6);
+        out6[6] = '\0';
+        return true;
+    }
+    return false;
+}
+
+// 引导选车：连接 raw 列表光标所指车辆 → 自动发加钥匙请求 → 等车主刷 NFC 卡。
+// 复用 connect_and_record（连接+落盘档案）与 handle_bind 同款绑定链路。
+static void handle_onb_select(void)
+{
+    if (!s_onb_active) {
+        return;
+    }
+    if (onb_busy()) {
+        tlb_ble_log(TLB_LOG_WARN, "引导：正在连接或等待刷卡，忽略重复选择");
+        return;
+    }
+    if (s_onb_n <= 0) {
+        onb_publish(TLB_ONB_FAIL, "没有可连接的车辆，请重扫");
+        return;
+    }
+    // 全局光标（跨页）：条目与原始记录都按全局序号取，worker 内读写无并发问题
+    int sel = s_onb_cursor;
+    if (sel < 0 || sel >= s_onb_n) {
+        sel = 0;
+    }
+    tlb_onb_item_t it = s_onb_items[sel];
+
+    char note[TLB_ONB_NOTE_MAX];
+    snprintf(note, sizeof(note), "%s", it.name[0] ? it.name : it.id);
+    char vin6[8];
+    bool has_vin = onb_vin6_of(it.name, vin6);
+
+    // 还没连上车（首次选择/上次连接失败）才发起连接；绑定失败重选时车还连着，
+    // 直接重发加钥匙请求，不做无谓的断连重连。
+    if (!tlb_ble_connected()) {
+        onb_publish(TLB_ONB_CONNECTING, note);
+        char err[160];
+        if (!connect_and_record(has_vin ? vin6 : "", &s_onb_raw[s_onb_raw_idx[sel]], err,
+                                sizeof(err))) {
+            onb_publish(TLB_ONB_FAIL, err[0] ? err : "连接失败，请重试");
+            return;
+        }
+    }
+
+    char msg[96];
+    tlb_sb_t sb;
+    sb_init(&sb, msg, sizeof(msg));
+    sb_puts(&sb, "引导：已连接 ");
+    sb_puts(&sb, note);
+    sb_puts(&sb, "，发送加钥匙请求，请刷 NFC 卡授权");
+    sb_log(TLB_LOG_INFO, &sb);
+    onb_publish(TLB_ONB_PAIRING, note);
+
+    // 哈希名/改名车拿不到 VIN 后 6 位：占位 "000000" 只喂给绑定守卫与预探针
+    // （VCSEC 会话按公钥走，占位值不参与任何加解密）；档案 VIN 留空，回连按 MAC。
+    const char *bind_vin = has_vin ? vin6 : "000000";
+    if (ensure_key(bind_vin)) {
+        tlb_ble_log(TLB_LOG_INFO, "已生成本机密钥对，接着把公钥交给车辆");
+    }
+    memset(&s_br, 0, sizeof(s_br));
+    tlb_bind_key(bind_vin, NULL, &s_sess[0], &s_ops, &s_scratch, &s_br);
+    tlb_ble_log(s_br.ok ? TLB_LOG_OK : TLB_LOG_ERROR, s_br.text);
+    if (s_br.ok && s_br.paired) {
+        mark_bound();
+        onb_publish(TLB_ONB_DONE, NULL);
+        tlb_ble_log(TLB_LOG_OK, "引导：绑定成功，2 秒后回首页，以后开机自动连车");
+        vTaskDelay(pdMS_TO_TICKS(2500)); // 让「绑定成功」在屏幕上停一会再回首页
+        s_onb_active = false;
+        return;
+    }
+    // 失败原因只取第一行（绑定结果文本可能多行，屏幕一行放不下）
+    char why[TLB_ONB_NOTE_MAX];
+    snprintf(why, sizeof(why), "%.63s", s_br.text);
+    for (char *p = why; *p != '\0'; p++) {
+        if (*p == '\n') {
+            *p = '\0';
+            break;
+        }
+    }
+    onb_publish(TLB_ONB_FAIL, why[0] != '\0' ? why : "绑定未完成，请靠近车辆重试");
 }
 
 static void handle_probe(const char *vin)
@@ -1014,6 +1387,40 @@ static void handle_forget(int arg)
     }
 }
 
+// 组合键出厂重置（社区用户自助换车/重置，不依赖串口）：
+// 断链停轮询 → 清密钥 → 清档案/两个域会话 → 清手输 VIN → 提示 1.5 秒 → 重启。
+// 重启后 tlb_app_init 见无密钥/无档案，自动进入首次绑定引导页。
+static void handle_factory_reset(void)
+{
+    tlb_ble_log(TLB_LOG_WARN, "开始出厂重置：清除全部钥匙数据");
+    tlb_ble_disconnect();
+    stop_loop("出厂重置");
+    lock_state();
+    tlb_store_clear(&s_backend, TLB_STORE_SLOT_KEY);
+    memset(&s_key, 0, sizeof(s_key));
+    s_have_key = false;
+    unlock_state();
+    sync_signer_ops();
+
+    tlb_nvs_profile_clear();
+    memset(&s_profile, 0, sizeof(s_profile));
+    lock_state();
+    tlb_store_clear(&s_backend, TLB_STORE_SLOT_VCSEC);
+    tlb_store_clear(&s_backend, TLB_STORE_SLOT_INFOTAINMENT);
+    tlb_v3_session_reset(&s_sess[0]);
+    tlb_v3_session_reset(&s_sess[1]);
+    unlock_state();
+
+    tlb_nvs_vin_clear();
+    s_vin[0] = '\0';
+
+    // 先发布重置态让屏幕显示提示，再延时重启
+    s_fac_reset = true;
+    tlb_ble_log(TLB_LOG_WARN, "钥匙数据已全部清除，即将重启进入首次绑定引导");
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    esp_restart();
+}
+
 static void handle_disconnect(void)
 {
     tlb_ble_disconnect();
@@ -1025,10 +1432,15 @@ static void handle_disconnect(void)
 
 // ---------------------------------------------------------------- 状态行
 // session-status.js:one(domain)
+// 偏离（设备侧专有）：追加 NVS 里持久化的 counter。上下文卡 §7.5 项 8 要判「复位后
+// counter 的基线由谁起算」，只看内存里那个数分不开两种解释。纯展示，不参与任何判读。
 static void sb_session_one(tlb_sb_t *sb, int idx)
 {
     const tlb_v3_session_t *s = &s_sess[idx];
     bool live = s->has_key && s->epoch_len > 0 && s->has_anchor;
+    uint32_t dom = (idx == 1) ? TLB_DOMAIN_INFOTAINMENT : TLB_DOMAIN_VCSEC;
+    tlb_store_session_t rec;
+    bool on_disk = (tlb_store_load_session(&s_backend, dom, &rec) == TLB_STORE_OK);
     sb_printf(sb, "%u@", (unsigned)s->counter);
     sb_puts(sb, live ? (s->ready ? "ready" : "未就绪") : "未握手");
     if (s->epoch_len > 0) {
@@ -1037,6 +1449,11 @@ static void sb_session_one(tlb_sb_t *sb, int idx)
             sb_printf(sb, "%02x", s->epoch[i]);
         }
         sb_puts(sb, "…");
+    }
+    if (on_disk) {
+        sb_printf(sb, "（盘上counter=%u）", (unsigned)rec.counter);
+    } else {
+        sb_puts(sb, "（盘上无存档）");
     }
 }
 
@@ -1103,6 +1520,43 @@ void tlb_app_auto_state(char *out, size_t cap)
     tlb_app_status(out, cap); // 兜底：没别的调用方只要这一小段
 }
 
+// UI 快照：key_ui.c 每个心跳轮询一次。全是单字节/对齐整数的 volatile 读，不加锁。
+void tlb_app_ui_snapshot(tlb_app_ui_t *out)
+{
+    if (!out) {
+        return;
+    }
+    out->connected = tlb_ble_connected();
+    out->trying = s_link_run;
+    out->tries = s_loop_tries;
+    out->ever_connected = s_ever_connected;
+    out->rke_action = s_rke_action;
+    out->rke_pending = s_rke_pending;
+    out->rke_ok = s_rke_ok;
+    out->rke_at = s_rke_at;
+    out->has_status = s_has_status;
+    for (int i = 0; i < 8; i++) {
+        out->closure[i] = s_closure[i];
+    }
+    out->lock_state = s_lock_state;
+    // 引导列表是多字段结构体，读写两侧都进临界区（注释见 tlb_ble.h 快照节）
+    portENTER_CRITICAL(&s_onb_mux);
+    out->onb_active = s_onb_active;
+    out->onb_stage = s_onb_pub.stage;
+    out->onb_count = s_onb_pub.count;
+    out->onb_cursor = s_onb_pub.cursor;
+    out->onb_total = s_onb_pub.total;
+    out->onb_page = s_onb_pub.page;
+    out->onb_pages = s_onb_pub.pages;
+    out->onb_at = s_onb_pub.at;
+    memcpy(out->onb_note, s_onb_pub.note, sizeof(out->onb_note));
+    for (int i = 0; i < TLB_ONB_LIST_MAX; i++) {
+        out->onb_list[i] = s_onb_pub.list[i];
+    }
+    portEXIT_CRITICAL(&s_onb_mux);
+    out->fac_reset = s_fac_reset;
+}
+
 // ---------------------------------------------------------------- worker
 static void handle_cmd(const cmd_msg_t *m)
 {
@@ -1134,6 +1588,12 @@ static void handle_cmd(const cmd_msg_t *m)
     case TLB_CMD_RKE:
         handle_rke(m->arg, vin);
         break;
+    case TLB_CMD_LID:
+        handle_lid(m->arg, vin);
+        break;
+    case TLB_CMD_STATUS_QUERY:
+        handle_status_query(vin);
+        break;
     case TLB_CMD_BIND:
         handle_bind(vin);
         break;
@@ -1151,6 +1611,15 @@ static void handle_cmd(const cmd_msg_t *m)
     }
     case TLB_CMD_FORGET:
         handle_forget(m->arg);
+        break;
+    case TLB_CMD_ONB_SELECT:
+        handle_onb_select();
+        break;
+    case TLB_CMD_ONB_RESCAN:
+        handle_onb_rescan();
+        break;
+    case TLB_CMD_FACTORY_RESET:
+        handle_factory_reset();
         break;
     default:
         break;
@@ -1205,6 +1674,29 @@ void tlb_app_post_vin(const char *vin)
     tlb_nvs_vin_save(up); // config/index.js:VIN_STORE —— 换车、清档案都不丢
 }
 
+bool tlb_app_onboarding(void) { return s_onb_active; }
+
+// 引导列表光标移动：按键任务直接调（只动一个 int），LVGL 侧经快照看到
+void tlb_app_onb_move(int delta)
+{
+    int n = s_onb_n;
+    if (n <= 0) {
+        return;
+    }
+    int c = s_onb_cursor + delta;
+    if (c < 0) {
+        c = 0;
+    }
+    if (c > n - 1) {
+        c = n - 1;
+    }
+    if (c == s_onb_cursor) {
+        return; // 已在边界，别白发布
+    }
+    s_onb_cursor = c;
+    onb_publish_window(); // 跨页时窗口整体换血，页内光标同步
+}
+
 esp_err_t tlb_app_init(void)
 {
     tlb_nvs_init();
@@ -1235,10 +1727,20 @@ esp_err_t tlb_app_init(void)
     load_sessions(); // v3-session-store.js:v3Session 的读盘分支
     sync_signer_ops();
 
-    xTaskCreate(worker_task, "tlb_worker", 12288, NULL, 5, NULL);
+    // core 的栈预算（tlb_dispatch.c / tlb_bind.c 头部注释里 gcc -fstack-usage 实测）最深链约
+    // 12.0KB，再叠上本层帧与 newlib printf，12KB 会被 bind 打穿（真机 Stack protection fault）。
+    // 按文档口径给 24KB —— 「设备侧任务栈按 24KB 给（16KB 不够）」。
+    xTaskCreate(worker_task, "tlb_worker", 24576, NULL, 5, NULL);
     xTaskCreate(link_task, "tlb_link", 8192, NULL, 4, NULL);
 
     // 探针 App.vue onShow → startAutoReconnectLoop；设备的「回到前台」就是开机
     tlb_app_post(TLB_CMD_LOOP_START, 0);
+    // 首次绑定引导：无密钥或无档案（社区新用户刷机后第一次开机）→ 自动进引导页，
+    // 全程不用输 VIN；已绑定的老板子照常自动连车，引导不出场。串口 forget/wipe
+    // 后重启也会重新走到这里。
+    if (!op_has_key(NULL) || !has_bind()) {
+        s_onb_active = true;
+        tlb_app_post(TLB_CMD_ONB_RESCAN, 0);
+    }
     return ESP_OK;
 }
