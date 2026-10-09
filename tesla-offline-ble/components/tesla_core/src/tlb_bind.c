@@ -370,10 +370,34 @@ tlb_err_t tlb_probe_enrollment(const char *vin, const tlb_bind_opts_t *opts, tlb
 //      否则时间不前进会转不出来。
 //   6) JS 里 vin 实参只喂给 ensureKey，真正发送用的是 state.vin（vinOrEmpty）；
 //      C 只有一个 vin 入参，两处同源。
+// 引导页「我已确认」检查（bindKey 等待循环内调用）。返回：0=没按下继续等；
+// 1=按下且探针通过（res 已填成功收尾）；-1=按下但没绑上（res 已填排查指引）。
+// 文案首行必须 ≤63 字节：设备层「失败:%s」按字节截断后上屏。
+static int bind_user_confirm_check(const char *vin, const tlb_bind_opts_t *opts, tlb_v3_session_t *s,
+                                   const tlb_dispatch_ops_t *ops, tlb_dispatch_scratch_t *sc,
+                                   tlb_bind_result_t *res, int *probes) {
+    tlb_probe_t p;
+    sb_t sb;
+
+    if (!opts || !opts->user_confirm || !opts->user_confirm()) {
+        return 0;
+    }
+    (*probes)++;
+    tlb_probe_once(vin, TLB_DOMAIN_VCSEC, s, ops, sc, &p);
+    if (p.paired) {
+        tlb_pair_verdict(&p, *probes, ops, res);
+        return 1;
+    }
+    sb_init(&sb, res->text, sizeof(res->text));
+    sb_put(&sb, "已确认，探针未通过：车端还没加白名单\n");
+    sb_put(&sb, p.text);
+    sb_put(&sb, "\n还要贴NFC钥匙卡：中控杯架前读卡区\n贴好后按右三立即验证；重新选车可再发起配对");
+    return -1;
+}
+
 tlb_err_t tlb_bind_key(const char *vin, const tlb_bind_opts_t *opts, tlb_v3_session_t *s,
                        const tlb_dispatch_ops_t *ops, tlb_dispatch_scratch_t *sc,
-                       tlb_bind_result_t *res)
-{
+                       tlb_bind_result_t *res) {
     char line[TLB_RESULT_TEXT_MAX];
     char last[TLB_PROBE_TEXT_MAX];
     char kid[16];
@@ -392,6 +416,7 @@ tlb_err_t tlb_bind_key(const char *vin, const tlb_bind_opts_t *opts, tlb_v3_sess
     int64_t now;
     size_t n;
     int rc;
+    int cc;
     int probes = 0;
     bool saw_wait = false;
     bool has_body;
@@ -501,6 +526,11 @@ tlb_err_t tlb_bind_key(const char *vin, const tlb_bind_opts_t *opts, tlb_v3_sess
             uint32_t info;
             const char *hint;
 
+            // 车端连发状态帧时也要看到用户的「我已确认」，不能被收帧循环饿死
+            cc = bind_user_confirm_check(vin, opts, s, ops, sc, res, &probes);
+            if (cc != 0) {
+                return (cc > 0) ? TLB_OK : TLB_ERR_NOT_PAIRED;
+            }
             tlb_decode_frame(sc->rx, (size_t)rc, &ctx, sc, &out);
             st = (out.obj.has_command_status && out.obj.has_operation_status) ? out.obj.operation_status : 0;
 
@@ -573,6 +603,10 @@ tlb_err_t tlb_bind_key(const char *vin, const tlb_bind_opts_t *opts, tlb_v3_sess
             has_body = (rc > 0);
         }
 
+        cc = bind_user_confirm_check(vin, opts, s, ops, sc, res, &probes);
+        if (cc != 0) {
+            return (cc > 0) ? TLB_OK : TLB_ERR_NOT_PAIRED;
+        }
         now = now_ms_of(ops);
         if (now >= deadline) {
             break;

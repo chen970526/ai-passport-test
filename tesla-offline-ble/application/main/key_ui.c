@@ -28,6 +28,7 @@
 #include "key_icons.h"
 #include "lvgl.h"
 #include "tesla_ble/tlb_ble.h"
+#include "vin_cfg.h" // NOVIN 引导页的接入点名/密码/地址与 vin_cfg.c 同源
 
 static const char *TAG = "key_ui";
 
@@ -86,7 +87,7 @@ static lv_obj_t *s_onb_dot[TLB_ONB_LIST_MAX];     // 列表行：疑似特斯拉
 static lv_obj_t *s_onb_name[TLB_ONB_LIST_MAX];    // 列表行：广播名
 static lv_obj_t *s_onb_vin6[TLB_ONB_LIST_MAX];    // 列表行：VIN 后 6 位（青色高亮）
 static lv_obj_t *s_onb_rssi[TLB_ONB_LIST_MAX];    // 列表行：信号强度
-static lv_obj_t *s_onb_hint;                      // 底部提示（VIN 后6位哪里找）
+static lv_obj_t *s_onb_vin;                       // 当前生效 VIN 行（步骤与列表之间）
 static lv_obj_t *s_onb_keys;                      // 底部按键说明
 static bool s_onb_shown;                          // 引导页当前是否占屏
 static lv_obj_t *s_log_full; // 全屏日志页（页2 独占，进入时创建/退出时删除）
@@ -290,7 +291,7 @@ static void set_home_visible(bool on)
 // 首次绑定引导页整组
 static void set_onb_visible(bool on)
 {
-    lv_obj_t *g[] = {s_onb_title, s_onb_step, s_onb_status, s_onb_hint, s_onb_keys, s_onb_panel};
+    lv_obj_t *g[] = {s_onb_title, s_onb_step, s_onb_vin, s_onb_status, s_onb_keys, s_onb_panel};
     set_group_visible(g, sizeof g / sizeof g[0], on);
 }
 
@@ -298,6 +299,9 @@ static void set_onb_visible(bool on)
 static const char *ONB_STEP_DEFAULT =
     "① 关闭手机蓝牙，车辆钥匙限3把\n② 坐进车内，唤醒车机\n③ 右一/右二选车，右三连接";
 static const char *ONB_STEP_PAIR = "车机弹出「添加钥匙」后\n请将NFC钥匙卡贴在\n中控杯架前的读卡区";
+// NOVIN 阶段：热点+内网网页配 VIN 的三步指引（文案用字均已在 14px 字库内；
+// SSID/密码/地址由 vin_cfg.h 宏拼出，改配置不用动这里）
+static char s_step_novin[128];
 
 // 按字节截断并回退到完整 UTF-8 码点（车主自定义广播名可能是中文）
 static void utf8_cut(const char *src, char *dst, size_t cap, size_t max_bytes)
@@ -320,8 +324,9 @@ static void utf8_cut(const char *src, char *dst, size_t cap, size_t max_bytes)
 
 static void onb_render(const tlb_app_ui_t *u)
 {
-    // 列表行：配对/完成阶段让位给刷卡指引与成功提示
-    bool list_show = (u->onb_stage != TLB_ONB_PAIRING && u->onb_stage != TLB_ONB_DONE);
+    // 列表行：配对/完成/配VIN阶段让位给刷卡指引、成功提示与配网三步曲
+    bool list_show = (u->onb_stage != TLB_ONB_PAIRING && u->onb_stage != TLB_ONB_DONE &&
+                      u->onb_stage != TLB_ONB_NOVIN);
     for (int i = 0; i < TLB_ONB_LIST_MAX; i++) {
         bool show = list_show && i < (int)u->onb_count;
         set_visible(s_onb_row[i], show);
@@ -397,6 +402,16 @@ static void onb_render(const tlb_app_ui_t *u)
         snprintf(st, sizeof(st), "绑定成功！正在进入首页");
         col = C_OK;
         break;
+    case TLB_ONB_NOVIN:
+        if (s_step_novin[0] == '\0') {
+            snprintf(s_step_novin, sizeof(s_step_novin),
+                     "①连WiFi:%s\n②密码:%s\n③打开 %s 填VIN", VIN_AP_SSID,
+                     VIN_AP_PASS, VIN_AP_IP);
+        }
+        snprintf(st, sizeof(st), "等待配置 VIN…");
+        col = C_WARN;
+        step = s_step_novin;
+        break;
     case TLB_ONB_FAIL:
     default: {
         char why[24];
@@ -409,8 +424,19 @@ static void onb_render(const tlb_app_ui_t *u)
     set_text(s_onb_status, st);
     lv_obj_set_style_text_color(s_onb_status, lv_color_hex(col), 0);
     set_text(s_onb_step, step);
-    lv_obj_set_style_text_color(s_onb_step,
-                                lv_color_hex(step == ONB_STEP_PAIR ? C_WARN : C_DIM), 0);
+    lv_obj_set_style_text_color(s_onb_step, lv_color_hex(
+        (step == ONB_STEP_PAIR || step == s_step_novin) ? C_WARN : C_DIM), 0);
+    // VIN 行：显示当前生效值（来自 NVS）；配网模式未配置时留空
+    char vb[24];
+    if (u->onb_vin[0] != '\0') {
+        snprintf(vb, sizeof(vb), "VIN:%.17s", u->onb_vin);
+        set_text(s_onb_vin, vb);
+    } else {
+        set_text(s_onb_vin, "");
+    }
+    // 底部只保留配对中的确认提示（右三 = 立即验证绑定结果），其余阶段留空
+    set_text(s_onb_keys,
+             u->onb_stage == TLB_ONB_PAIRING ? "右三=已确认，立即验证" : "");
 }
 
 // RKE 成功文案。动作号语义以 tlb_types.h 的 RKEAction_E 为准：
@@ -788,10 +814,11 @@ esp_err_t key_ui_start(void)
     s_onb_step = add_label(scr, MARGIN_X, 40, LCD_W - 2 * MARGIN_X, 54, &key_font_14, C_DIM,
                            ONB_STEP_DEFAULT);
     lv_obj_set_style_text_align(s_onb_step, LV_TEXT_ALIGN_LEFT, 0);
-    s_onb_status = add_label(scr, MARGIN_X, 98, LCD_W - 2 * MARGIN_X, 18, &key_font_14, C_INK, "");
+    s_onb_vin = add_label(scr, MARGIN_X, 97, LCD_W - 2 * MARGIN_X, 16, &key_font_14, C_INK, "");
+    s_onb_status = add_label(scr, MARGIN_X, 117, LCD_W - 2 * MARGIN_X, 18, &key_font_14, C_INK, "");
     // 列表卡片：圆角边框容器，纵向 flex，每行是横向 flex
     s_onb_panel = lv_obj_create(scr);
-    lv_obj_set_pos(s_onb_panel, MARGIN_X - 2, 118);
+    lv_obj_set_pos(s_onb_panel, MARGIN_X - 2, 142);
     lv_obj_set_size(s_onb_panel, LCD_W - 2 * MARGIN_X + 4, 116);
     lv_obj_set_style_bg_color(s_onb_panel, lv_color_hex(C_CARD_BG), 0);
     lv_obj_set_style_bg_opa(s_onb_panel, LV_OPA_COVER, 0);
@@ -854,11 +881,7 @@ esp_err_t key_ui_start(void)
         lv_obj_set_style_pad_all(s_onb_rssi[i], 0, 0);
         lv_label_set_text(s_onb_rssi[i], "");
     }
-    s_onb_hint = add_label(scr, MARGIN_X, 240, LCD_W - 2 * MARGIN_X, 32, &key_font_14, C_DIM,
-                           "青色=疑似你的车\n其他设备也可选中绑定");
-    lv_obj_set_style_text_align(s_onb_hint, LV_TEXT_ALIGN_LEFT, 0);
-    s_onb_keys = add_label(scr, MARGIN_X, 278, LCD_W - 2 * MARGIN_X, 18, &key_font_14, C_DIM,
-                           "双击右三重扫 · 长按右三诊断");
+    s_onb_keys = add_label(scr, MARGIN_X, 292, LCD_W - 2 * MARGIN_X, 18, &key_font_14, C_WARN, "");
     set_onb_visible(false);
 
     lv_screen_load(scr);

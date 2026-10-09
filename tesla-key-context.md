@@ -12,9 +12,10 @@
 | 项 | 当前值 |
 | --- | --- |
 | 主工程 | `tesla-offline-ble\`（ESP-IDF v5.5.3 / ESP32-C3，**2026-10-03 起 = 车钥匙整机：BLE 链路 + LVGL 屏幕界面 + 三按键 + 2 秒固定轮询**） |
-| Git | 仓库根 = 本文件所在目录（**不写盘符，见 §2 相对路径口径**），remote `https://github.com/chen970526/ai-passport-test.git`，分支 `feature/tesla-offline-ble`，HEAD `6ca45cf 提交md文档`；**工作区有未提交改动**（`tlb_ble.c`、`tlb_nvs_store.c`、`tlb_port_esp.c`、`app_main.c`、`CMakeLists.txt`、`tlb_app.c`、`tlb_console.c`、`tlb_ble.h`、**新增 `key_ui.c/.h`、`assets/fonts/key_font_20.c`/`key_font_14.c`、`tools/gen_key_font.py`、`sdkconfig.defaults`**、本文件），按 §8.1 **不 commit** |
-| ESP-IDF 构建 | **PASS（2026-10-03 车钥匙化改动后）**：`build\tesla-offline-ble.bin` = **1,140,240 B（`0x116410`**，factory 0x7f0000，约 86% free）。体积从 691,776 涨到 ~1.11 MB 的原因：链接进 LVGL 9.6 + esp_lvgl_port + iot_button + bsp 显示/按键 + 两个中文子集字体（非压缩，双字库：key_font_20 107 KiB / key_font_14 416 KiB，见 §7.7）。**已烧录（第 7~22 次，均分件刷 app @0x10000、0x9000 未动、hash 校验过）**。**板上现行 = 第二十四次（UI_SPEC 首页版，`0x128650` = 1,214,032 B，85% free）**，历史：第 7 次=车钥匙整机首版 → 第 8 次=字体/几何自检诊断版 → 第 9 次=**字库去压缩修复版（文字恢复显示）** → 第 10 次=ADC 采样诊断版（证实右三 603 mV 正常） → 第 11 次=按键屏幕反馈版 → 第 12 次=屏幕诊断版（长按右三切换 ADC/事件计数/RAM/连接显示；同日经用户授权执行 `wipe_legacy` 清 `trae_cfg` 并复验绑定完好）→ 第 13 次=日志页版（页2 双行小字显示最近两条，因遮挡被用户否决）→ 第 14 次=**全屏日志页版**（vprintf 钩子 tee 进 8×160B 静态环形缓冲；页2 整屏一次一条日志自动换行，右三单击逐条翻看，底部 N/8；页1 增加「启=重启原因」中文）→ 第 15 次=**安全边距版**（`UI_MARGIN=10` 物理像素应对壳子圆角，全部界面元素与日志页统一缩进）→ 第 16 次=自动进诊断版（电池态排障临时）→ 第 17 次=**app_button 分叉驱动版**（application/main 自带一份 bsp_button 源码：ADC 读失败重试 3 次/真实错误码上屏/自愈重 init）→ 第 18 次=init 自检读+NimBLE 日志降 WARNING（同步进 sdkconfig.defaults）→ 第 19 次=init 失败也粘存错误码+每 5 秒自愈重试（ui_tick 驱动）→ 第 20 次=**按键 init 挪到 console 之前**+自动翻页（排障临时）→ 第 21 次=诊断页1 加「阶=N」启动阶段打点 → 第 22 次=删除全部排障临时逻辑，诊断恢复纯手动（用户电池实机复验通过：ADC=2921mV、三键正常，根因定案见 §7.7）→ 第 23 次=**前备箱/后备箱开盖**（closureMoveRequest 编码器 + vehicleStatus 内层解析 + 右三单击=前备箱/双击=后备箱 + 首页矢量俯视车）→ 第 24 次=**现行：按 `UI_SPEC.md` 推翻重做首页**（TESLA/Model Y 品牌区+连接状态点+car 图标 88px+锁车/解锁/前备箱三卡片+check 反馈 600ms；8 个 48×48 PNG 转 L8 遮罩图标约 18KB，tools\gen_key_icons.py 生成；旧硬件测试首页元素全删；诊断页1/页2 与阶段打点原样保留为 DEBUG）。更早（第六次及以前）：基线 625,616 → 690,080 → 690,112 → 690,144 → 691,776 |
-| 主机测试（金标准/对抗） | **NOT RUN**（`tests\host\run.ps1` 未执行；上次记录 2533 checks 属于旧机器，不能当本轮结论）。**2026-10-08 复核：gcc 已可用**（WinLibs，在 PATH）→ 旧「无 gcc 无法执行」的阻塞解除，随时可补跑（换机先 `gcc --version` 自查） |
+| Git | 仓库根 = 本文件所在目录（**不写盘符，见 §2 相对路径口径**），remote `https://github.com/chen970526/ai-passport-test.git`，分支 `feature/tesla-offline-ble`，HEAD `6ca45cf 提交md文档`；**工作区有未提交改动**（`README.md`、`application/main/{CMakeLists.txt, app_main.c, key_ui.c, tlb_app.c}`、`tlb_ble.h`、`tlb_bind.h/.c`、`sdkconfig.defaults`、`tests/host/goldens.h`、**新增 `vin_cfg.c/.h`、`flash.ps1`、`flash.bat`、`peek.py`**、本文件），按 §8.1 **不 commit** |
+| ESP-IDF 构建 | **PASS（2026-10-09 实跑，VIN 配网热点版）**：`build\tesla-offline-ble.bin` = **1,823,376 B（`0x1BD290`**，factory 0x7f0000，约 78% free）。历史：车钥匙化后 1,140,240 B → 2026-10-08 重构建 1,303,056 B → 本版链接进 Wi-Fi SoftAP + esp_http_server + DNS 门户（`vin_cfg.c`）再涨。体积从 691,776 涨到 ~1.11 MB 的原因：链接进 LVGL 9.6 + esp_lvgl_port + iot_button + bsp 显示/按键 + 两个中文子集字体（非压缩，双字库：key_font_20 107 KiB / key_font_14 416 KiB，见 §7.7）。**已烧录（第 7~22 次，均分件刷 app @0x10000、0x9000 未动、hash 校验过）**。**板上现行 = 第二十八次（引导页布局修复 + 遮挡排查，2026-10-09）**，历史：第 7 次=车钥匙整机首版 → 第 8 次=字体/几何自检诊断版 → 第 9 次=**字库去压缩修复版（文字恢复显示）** → 第 10 次=ADC 采样诊断版（证实右三 603 mV 正常） → 第 11 次=按键屏幕反馈版 → 第 12 次=屏幕诊断版（长按右三切换 ADC/事件计数/RAM/连接显示；同日经用户授权执行 `wipe_legacy` 清 `trae_cfg` 并复验绑定完好）→ 第 13 次=日志页版（页2 双行小字显示最近两条，因遮挡被用户否决）→ 第 14 次=**全屏日志页版**（vprintf 钩子 tee 进 8×160B 静态环形缓冲；页2 整屏一次一条日志自动换行，右三单击逐条翻看，底部 N/8；页1 增加「启=重启原因」中文）→ 第 15 次=**安全边距版**（`UI_MARGIN=10` 物理像素应对壳子圆角，全部界面元素与日志页统一缩进）→ 第 16 次=自动进诊断版（电池态排障临时）→ 第 17 次=**app_button 分叉驱动版**（application/main 自带一份 bsp_button 源码：ADC 读失败重试 3 次/真实错误码上屏/自愈重 init）→ 第 18 次=init 自检读+NimBLE 日志降 WARNING（同步进 sdkconfig.defaults）→ 第 19 次=init 失败也粘存错误码+每 5 秒自愈重试（ui_tick 驱动）→ 第 20 次=**按键 init 挪到 console 之前**+自动翻页（排障临时）→ 第 21 次=诊断页1 加「阶=N」启动阶段打点 → 第 22 次=删除全部排障临时逻辑，诊断恢复纯手动（用户电池实机复验通过：ADC=2921mV、三键正常，根因定案见 §7.7）→ 第 23 次=**前备箱/后备箱开盖**（closureMoveRequest 编码器 + vehicleStatus 内层解析 + 右三单击=前备箱/双击=后备箱 + 首页矢量俯视车）→ 第 24 次=**按 `UI_SPEC.md` 推翻重做首页**（TESLA/Model Y 品牌区+连接状态点+car 图标 88px+锁车/解锁/前备箱三卡片+check 反馈 600ms；8 个 48×48 PNG 转 L8 遮罩图标约 18KB，tools\gen_key_icons.py 生成；旧硬件测试首页元素全删；诊断页1/页2 与阶段打点原样保留为 DEBUG）→ 第 25 次=**VIN 配网热点首版** → 第 26 次=**配网页 pattern 漏 S~Y 修复**（用户手机实测保存成功）→ 第 27 次=**引导页加 VIN 行、底部提示删减** → 第 28 次=**现行：布局修复（卡片 135→142、状态行 115→117）+ 遮挡排查确认 set_onb_visible 已含 s_onb_vin + 非 Tesla 设备超时属正常行为**。更早（第六次及以前）：基线 625,616 → 690,080 → 690,112 → 690,144 → 691,776 |
+| 主机测试（金标准/对抗） | **PASS（2026-10-09 实跑 `tests\host\run.ps1`）：2547 checks, 0 failed**（覆盖本轮 `tlb_bind` 改动与重生成 `goldens.h`；旧「NOT RUN / 2533 checks」记录作废） |
+| **2026-10-09 VIN 配网热点（已实现 + 真机串口验证 PASS）** | 无 VIN 开机 = **纯配网模式**：只留「屏幕提示页 + SoftAP + DHCP + DNS 门户 + httpd」，**蓝牙栈/worker/link 任务全不启动**（C3 内存实测 BLE 栈吃 ~105 KB，BLE+WiFi 共存必死，见 §1）。SSID `AI-PASSPORT-TSL` / 密码 `87654321` / 网关 **192.168.4.2**（特意避开另一固件占用的 4.1）；门户弹窗 = DNS 劫持（UDP:53 全应答 4.2）+ DHCP 选项 114 + 10 个探测路径 302 到 `/`。网页保存 VIN → 写 NVS → 2 秒后 `esp_restart()` 进正常模式（开蓝牙、热点不再开）；**不做运行中热切换**。sdkconfig 已关 `ESP_WIFI_IRAM_OPT`/`RX_IRAM_OPT`（C3 上 IRAM=DRAM，省 ~70 KB）。新增文件 `application\main\vin_cfg.c/.h`，`tlb_app.c` 以 `s_cfg_mode` 分流；串口 REPL `vin` 保留为开发通道。实测日志：`开热点前堆: 空闲内部=97812 最大内部块=86016` → softAP 起 → `DHCP server started ... IP: 192.168.4.2` → `DNS 已监听 :53` → `配网热点已开启：AI-PASSPORT-TSL`，无警告。**已用户手机实测 PASS（2026-10-09 第 26/27 次刷写）**：真车 VIN `LRWYGCEJ0TC723591` 经网页保存成功、重启后串口回显「本机记录的 VIN=LRWYGCEJ0TC723591」、热点不再开。踩坑两处：① 配网页 input `pattern` 曾写成 `[A-HJ-NPRZ0-9]`（R-Z 少横杠 → S~Y 全被误拒，Chrome 弹「请与所请求的格式保持一致」），已修正为 `[A-HJ-NPR-Z0-9]`；② 绑定引导页改版（用户口径）：底部「青色=疑似你的车/其他设备也可选中绑定/双击右三重扫·长按右三诊断」全删，步骤与列表之间新增 VIN 行（快照新字段 `onb_vin[18]`，来自 `active_vin()`），列表下移到 y=135，底部仅配对阶段留「右三=已确认，立即验证」。**第 28 次（用户实机反馈 + 修复）**：① 选了非 Tesla 设备（`220Fb16f`）→ 连接后服务发现超时（非 bug：非 Tesla 无 0211/0212/0213 服务，`GATT_PROC_MS=8000`），状态行显示「失败:服务发现超时」。车没广播 VCSEC 时列表里**没有**青色圆点标记，扫描结果里所有设备都是灰色——属正常行为，绑定时务必等车唤醒（坐进车内）且列表出现青色疑似车再选（见 §7.3 绑定前 checklist）。② 布局修复：卡片 y=135→142、状态行 y=115→117，VIN 行（y=97，底 113）与状态行（y=117-135）差 4px，状态行与卡片顶（y=142）差 7px，不再视觉拥挤。③ 可见性链复核：`set_onb_visible()` 数组已含 `s_onb_vin`（L294），诊断页1（长按右三）/全屏日志页（右三单击翻页）/出厂重置提示均正确隐藏引导页全部 6 元素 |
 | 真机测试 | **PASS：步骤 1-7（2026-10-03 实车 + 实体 NFC 卡在场）**。扫描命中 → 连接 → 停扫 → 服务 `0211`/订阅 `0213` INDICATE/MTU **247** → **绑定成功**（车端直接回终态 `WHITELISTOPERATION_INFORMATION_NONE(0)`）→ **两域 V3 握手全部 `SESSION_INFO_STATUS_OK`** → **RKE 三个动作号全部实机受理**（第六次刷写后逐条授权连发）：`rke 1`=LOCK 明文`1001` 车 counter=3、`rke 0`=UNLOCK 明文`1000` 车 counter=4（**首次实机，§7.5 项 4 就此关闭**）、`rke 20`=REMOTE_DRIVE 明文`1014` 车 counter=5，三次均 `[ok] 空响应（车辆已受理）`、无任何 `FAULT_*`/`GENERICERROR_*`。步骤 4（BLE 层 bond）仍失败、步骤 8 **部分验**（重启 counter 不回退已定论，拉黑距离/断电重连与重复绑定幂等未验）；详见 §7.3 |
 | NVS 内容清点（2026-10-03 只读解析 `nvs-before-flash6-*.bin`，用 IDF `nvs_partition_tool/nvs_tool.py -d all`） | **4 个命名空间**：① `phy`（`cal_data`/`cal_mac`/`cal_version`，ESP-IDF 系统 PHY 校准，**该留**）；② **`trae_cfg`（`profile` blob 245 B，内含 `FoloToy`/`NETRUNNER`/`avatar-01`）= 旧 ai-passport 应用的配置，就是用户说的"旧东西"**；③ `tesla_ble`（`vin`=`5YJ3E1EA7KF000000` ✓、`key` 128 B 密钥对、`bind` 152 B、`v3_info`/`v3_session` 各 112 B = **当前可用绑定，清掉就要回车里刷实体 NFC 卡重绑**）；④ `nimble_bond`（`local_irk_1` 23 B）。另：NVS 里能搜到 `FAKEVIN000000001`/`FAKEVIN000000002`/`11:22:33:44:55:66` 等**别辆车**的 VIN/MAC，但它们全在状态为 `Erased`（被后续写覆盖）的历史条目里，**不是活数据**，压缩后即消失。<br>**固件本体已证实是纯的**：map 文件里 `liblvgl__lvgl.a(` / `esp_lvgl_port` / `esp_codec_dev` / `button` 的**被链接对象数 = 0**（只在链接器 LOAD 行出现），`application/main/CMakeLists.txt` 只 `REQUIRES tesla_ble tesla_core` → 691,776 B 里没有一行 GUI/音频代码。`managed_components\` 里的 lvgl 等目录只是**仓库残留**，不进产物 |
 | 刷机期修复 | ① `ble_att_set_preferred_mtu(517)` 早于 `nimble_port_init()` → 开机 Load access fault（`tlb_ble.c`）；② `tlb_nvs_init()` 漏 `nvs_flash_init()` → NVS 全程未初始化（`tlb_nvs_store.c`）；③ `bind` 崩 `tlb_worker` 栈（`MCAUSE 0x1b` 栈保护）→ `xTaskCreate` 栈 **12288 → 24576**（`app_main.c`/`tlb_app.c`，实测最深链 ≈12.0 KB，**16 KB 不够**）；④ **ECDH 一律 `-0x4f80`** → mbedTLS 3.x `mbedtls_ecp_mul_restartable` 入口硬守卫 `f_rng == NULL` 直接返回 `BAD_INPUT_DATA`，`tlb_port_ecdh()` 传 `tlb_rng` 修复（详见 §5.7）。**四处都只有真机才暴露** |
@@ -25,7 +26,7 @@
 | NVS 备份 | ⚠ **仓库里没有任何 NVS 备份文件**（`nvs-backups\` 尚未创建）—— 旧机上那批 `nvs-20261002-134822.bin`、`nvs-after-fix.bin`、`nvs-before-car.bin`、`nvs-before-flash6-20261003-022401.bin`（第六次刷写前 = 最完整的可用绑定快照）都没迁过来，**别指望历史快照**。**→ 手动烧录前必须现做一份：§7.8 步骤 4 落到仓库内 `nvs-backups\`**（相对位置固定；文件不入库，换机要手动拷）。**⚠ 板内 NVS 现况（据旧机记录，尚未复核）：NVS 里有「本车绑定成功的密钥 + 会话 counter + 档案 deviceId」，第六次刷写后 `keyId=DE:AD:BE:EF`、deviceId、counter 全部保留（分件刷写不碰 0x9000 已六次实证）。当前盘上 counter：VCSEC=4、车机域=0。再刷任何固件若动到 NVS 就要重新拿实体 NFC 卡绑；刷前仍按 §7.2 备份 + 复述风险** |
 | 旁支探针 | `tesla-ble-probe\`（uni-app 纯 JS，未重跑） |
 | 参考仓容器测试 | **未开始**：`ref-repos\` **已在仓库内**（2026-10-08 复核，§10 旧「整目录缺失」记录作废）→ `test_tlb_message_builders.cpp` 可以创建；但**当前机器无 docker**（`docker` 不识别；换机先 `docker version` 自查）→ 容器 gtest 仍跑不了 |
-| **下一步** | **车钥匙整机全部核心功能实车达标（2026-10-03）**：连车、上锁、解锁、启动授权用户确认均正常（§7.7）；`wipe_legacy` 已执行复验（§7.2）；屏幕诊断版现行可用。剩余按序：⑬ **电池态按键失灵已修复并经用户实机复验**（第 16~22 次刷写；根因=电池态 `tlb_console_start()` 无 USB 主机时阻塞主任务，按键初始化排其后永不执行→挪到其前；诊断恢复纯手动：长按右三切换、单击右三翻页）；⑭ **UI 优化**（用户口径允许延后，现在可以开始）；旧待办不变：⑦ §7.3 步骤 8 余下项（拉黑距离/断电重连、重复绑定幂等）；⑧ 补跑 §6.2 主机金标准（在仓库根跑 `powershell -ExecutionPolicy Bypass -File tesla-offline-ble\tests\host\run.ps1`）；⑨ §7.5 项 6：BLE bond 被 `BLE_SM_ERR_AUTHREQ(0x03)` 拒，是否动 `sm_io_cap`/`sm_bonding` 由用户定；⑩ 待验动作号 29、30 —— 每条单独授权（§8.3）。**烧录授权口径（2026-10-03 用户更新）：用户在场时烧录无需逐次授权，但分件刷 app 不碰 0x9000 + 刷前 NVS 备份的红线不变**；**2026-10-08 起改为用户自行手动烧录（照 §7.8 一步步走），AI 不再代刷**。**按键操作口径（实测教训）：动作只认单击，按住 >2 s 变长按不触发；带板测试务必快速轻按** |
+| **下一步** | **车钥匙整机全部核心功能实车达标（2026-10-03）**：连车、上锁、解锁、启动授权用户确认均正常（§7.7）；`wipe_legacy` 已执行复验（§7.2）；屏幕诊断版现行可用。剩余按序：⑬ **电池态按键失灵已修复并经用户实机复验**（第 16~22 次刷写；根因=电池态 `tlb_console_start()` 无 USB 主机时阻塞主任务，按键初始化排其后永不执行→挪到其前；诊断恢复纯手动：长按右三切换、单击右三翻页）；⑭ **UI 优化**（用户口径允许延后，现在可以开始）；旧待办不变：⑦ §7.3 步骤 8 余下项（拉黑距离/断电重连、重复绑定幂等）；⑧ 补跑 §6.2 主机金标准（在仓库根跑 `powershell -ExecutionPolicy Bypass -File tesla-offline-ble\tests\host\run.ps1`）；⑨ §7.5 项 6：BLE bond 被 `BLE_SM_ERR_AUTHREQ(0x03)` 拒，是否动 `sm_io_cap`/`sm_bonding` 由用户定；⑩ 待验动作号 29、30 —— 每条单独授权（§8.3）。**烧录授权口径（2026-10-03 用户更新）：用户在场时烧录无需逐次授权，但分件刷 app 不碰 0x9000 + 刷前 NVS 备份的红线不变**；**2026-10-08 起改为用户自行手动烧录（照 §7.8 一步步走），AI 不再代刷**。**按键操作口径（实测教训）：动作只认单击，按住 >2 s 变长按不触发；带板测试务必快速轻按**。**2026-10-09 新增待办**：手机实测 VIN 配网页全流程（连热点 → 门户弹窗/手动开 http://192.168.4.2 → 填 VIN → 保存重启；无线部分 AI 无法代测） |
 | **环境与手动烧录（2026-10-08）** | **路径口径已统一为「相对仓库根、不写盘符」（§2）—— 换电脑、换盘符都不用改命令**。IDF 装在哪只影响「激活那一行」，端口每次按 §7.8 步骤 1 现查（机器上可能挂着别的串口，别凭记忆抄号）。2026-10-08 复核：HEAD 已是 `f35655d 完成开锁上锁，前后备箱功能`（工作区仅 zip/`UI_SPEC.md.localbak` 等杂项，源码干净）；`ref-repos\` 四个参考仓已到位、gcc 已可用 → §6.2/§6.4 的「缺失/无 gcc」阻塞解除；重新构建 **PASS**：`tesla-offline-ble\build\tesla-offline-ble.bin` = **1,303,056 B（`0x13e210`**，factory 0x7f0000，84% free）。`tlb_cmd.py`/`probe_console.py` 不在仓库内（旧机散落脚本）→ 手动流程用 `idf.py monitor`。**用户自行一步步手动烧录的完整 SOP 见 §7.8**（端口现查、NVS 备份、分件刷 app、monitor 自检、故障处置表） |
 
 ---
@@ -44,6 +45,7 @@
 | **任务栈** | **`tlb_worker` 必须 24576 B（16 KB 不够）**：`gcc -fstack-usage` 实测 `tlb_send_request 6240B` / `tlb_handshake 5936B` / `tlb_decode_frame 5632B`，最深链 ≈12.0 KB + 调用帧。12288 B 时 `bind` 必崩 `MCAUSE 0x1b`（栈保护 fault），现场可见 `0xa5a5a5a5` 空闲填充 | 真机崩溃现场 + `.su` 实测 |
 | 板级其余 | **2026-10-03 起已使用**：面板 ST7789P3 240×320 RGB565 SPI + 背光 GPIO21（`key_ui.c` 经 bsp 点亮，背光 80%）、GPIO0 三键共用一路 ADC 分压（`BSP_BTN_MV_TABLE`：UP={0,150}mV / DOWN={150,447}mV / OK={447,1900}mV，`iot_button` 驱动）；电池未读取。「左上角开机」是硬件电源键，软件读不到。`EXTRA_COMPONENT_DIRS` 挂 `../ai-passport/components` 复用 bsp（**只复用，不改 ai-passport 仓**）；`managed_components\` 已随工程就位（LVGL 9.5 / esp_lvgl_port 2.9.0 / iot_button 4.2.0），构建无需联网 | `tesla-offline-ble/CMakeLists.txt`、`ai-passport/components/bsp`、`key_ui.c`/`app_main.c` |
 | LVGL 配置 | `sdkconfig.defaults` 新增段：`CONFIG_LV_COLOR_DEPTH_16=y`、montserrat 14/20、**`CONFIG_LV_MEM_SIZE_KILOBYTES=24`**。⚠ 坑：旧 `sdkconfig` 里该值为 **0**（LVGL 对象池为零，`lv_obj_create` 真机必崩）→ 已删 `sdkconfig` 重配重编，生成的 `build\config\sdkconfig.h` 实测 =24 | `tesla-offline-ble/sdkconfig.defaults` |
+| **Wi-Fi 共存内存（2026-10-09 实测钉死）** | **BLE+WiFi 装不下**：BLE 栈（controller + NimBLE host + worker 24 KB + link 8 KB 栈）吃掉 ~105 KB，界面就绪后空闲 111,600 B → 热点启动前仅剩 6,004 B（最大块 4,096 B），`esp_wifi_init` 必 `ESP_ERR_NO_MEM`。对策=**配网模式根本不启蓝牙**（§0 2026-10-09 行），VIN 存好靠重启切换。另 sdkconfig 已关 `CONFIG_ESP_WIFI_IRAM_OPT`/`CONFIG_ESP_WIFI_RX_IRAM_OPT` —— C3 上 IRAM 与 DRAM 是同一块物理 RAM，这两项吃 ~70 KB，是 `alloc pm_beacon_offset fail` 主因 | 堆探针实测 + 真机串口日志 |
 
 ---
 
@@ -110,10 +112,15 @@ application/main
   ├─ key_ui.c/.h  LVGL 最小车钥匙界面（标题+spinner+主状态+副行+按键提示，150 ms lv_timer）。
   │               唯一数据源 = tlb_app_ui_snapshot()（原子量），绝不碰 BLE 状态机；LV_FONT_DECLARE(key_font_20/14)
   ├─ tlb_console.c esp_console REPL（USB-Serial-JTAG），命令→tlb_app_post 的薄映射层 + wipe_legacy 直操 NVS，见 §7.6
+  ├─ vin_cfg.c/.h 无 VIN 时的配网热点（2026-10-09）：SoftAP（AI-PASSPORT-TSL / 87654321 / 192.168.4.2）+ 配网页（esp_http_server，
+  │               12 URI，max_uri_handlers=16/栈 3072）+ DNS 门户（自建 UDP:53 全劫持 + DHCP 选项 114 + 10 个探测路径 302）；
+  │               保存 VIN → 写 NVS → 延时 2 秒 esp_restart()；**配网模式蓝牙栈不启动**（内存所限，见 §1 Wi-Fi 共存内存行）
   └─ tlb_app.c    （~1260 行）worker 任务 + 命令队列 + 独立 link 自动重连任务；**2026-10-03 起固定 2 秒轮询**：
                   定向扫描 2 s → 全量扫描 2 s → 等 2 s 再下一轮（退避档位 k_retry_steps_ms 已删）；
                   connect → 停扫 → delay(600) → 发现服务 → 订阅 0x0213(INDICATE) → 协商 MTU；TIB（BLE security initiate + NVS bond）；
-                  新增 tlb_app_ui_snapshot() + s_ever_connected/s_rke_* 快照量；探针全部中文文案逐字复现
+                  新增 tlb_app_ui_snapshot() + s_ever_connected/s_rke_* 快照量；探针全部中文文案逐字复现；
+                  **2026-10-09 配网分流**：tlb_app_init 无 VIN 时置 s_cfg_mode、只 vin_cfg_start() 后直接 return（不启 BLE 栈/worker/link），
+                  VIN 存 NVS 后重启进正常模式；AP 失败上屏「AP启动失败 见串口」
 assets/fonts/key_font_20.c / key_font_14.c —— tools/gen_key_font.py 生成（lv_font_conv@1.5.3 + simhei.ttf，136 字形子集）
 components/tesla_ble     —— IDF 侧
   ├─ tlb_ble.c           NimBLE central 主机（扫描/连接/GATT/帧收发，2460 行）
@@ -128,7 +135,7 @@ components/tesla_core    —— 纯 C，零 IDF 依赖，主机可测（13 模�
   └─ tlb_store / tlb_text / tlb_meta    存储抽象 / 中文文案表 / 元数据
 ```
 
-**修改红线**：应用区只允许动 `application\main\{CMakeLists.txt, tlb_app.c, tlb_console.c, app_main.c, key_ui.c, key_ui.h}`、`assets\fonts\key_font_*.c`（由 `tools\gen_key_font.py` 再生成，勿手改）与 `components\**` 的必要定点小修；**绝不碰** `ai-passport\main\**`（bsp 只复用不修改）；探针与 ref-repos 只读。
+**修改红线**：应用区只允许动 `application\main\{CMakeLists.txt, tlb_app.c, tlb_console.c, app_main.c, key_ui.c, key_ui.h, vin_cfg.c, vin_cfg.h}`、`assets\fonts\key_font_*.c`（由 `tools\gen_key_font.py` 再生成，勿手改）与 `components\**` 的必要定点小修；**绝不碰** `ai-passport\main\**`（bsp 只复用不修改）；探针与 ref-repos 只读。
 
 **日志规则**：BLE 失败**只以中文文本呈现，绝不出现数字错误码**；所有文案逐字来自探针（`tlb_text.c` 为文案表）。
 
@@ -227,11 +234,11 @@ if (f_rng == NULL) {
 ### 6.1 ESP-IDF 固件构建（2026-10-08 实跑 PASS）
 §2 首条命令。全量约 2063 个目标；已知良性警告仅 1 条：`tlb_ble.c` L105 `#define LINE_MAX 2600` 与 newlib 重定义 —— 无害勿动。
 
-### 6.2 主机金标准/对抗测试（**尚未实跑**；历史记录 2533 checks / 0 failed。**2026-10-08：gcc 已就位 → 阻塞解除，下面这条命令可以直接执行**）
+### 6.2 主机金标准/对抗测试（**2026-10-09 实跑 PASS：2547 checks / 0 failed**）
 ```powershell
 powershell -ExecutionPolicy Bypass -File tesla-offline-ble\tests\host\run.ps1   # 相对仓库根；可加 -Regen 重生成 goldens
 ```
-（脚本用 `$PSScriptRoot` 自定位、不依赖绝对路径，任何机器可直接跑；**2026-10-08 尚未实跑**，结论仍记 NOT RUN。）
+（脚本用 `$PSScriptRoot` 自定位、不依赖绝对路径，任何机器可直接跑。）
 - `tools\gen_goldens.mjs`（Node）生成 `tests\host\goldens.h`；`test_core.c` + `tlb_port_host.c` 与全部 `tesla_core/src/*.c` 用 gcc `-std=c11 -Wall -Wextra -Werror` 编译。
 - **改了 `tesla_core` 任何编解码必须重跑此测试**；改动报文格式时先 `-Regen` 核对金标准来源。
 - 本轮改动只涉及 `tesla_ble`（IDF 侧，含 `tlb_port_esp.c` 的 ECDH `f_rng` 修复）与 `application\main`，`tests\host` 不编译 `tlb_nvs_store.c`/`tlb_ble.c`/`tlb_port_esp.c`（主机侧 ECDH 走 `tlb_port_host.c` 自己的实现，不经 mbedTLS）→ **金标准不受影响**，但收尾前应补跑一次（gcc 已就位，无需再装）。
@@ -297,6 +304,8 @@ python -m esptool --chip esp32c3 -p COMx --baud 921600 --before default_reset --
 
 **进度（2026-10-03，实车 `5YJ3E1EA7KF000000` + 实体 NFC 卡在场）：1-3、5-7 PASS；4 FAIL（BLE 层加密链路未通，不影响应用层）；8 部分验（重启 counter 不回退已定论，见 §7.5 项 8）。**
 
+**2026-10-09 配网热点冒烟（第 25 次刷写后，串口实测 PASS）**：无 VIN 开机 → 纯配网模式（蓝牙栈未启动）→ `开热点前堆: 空闲内部=97812 最大内部块=86016` → softAP 起 → `DHCP server started ... IP: 192.168.4.2` → `DNS 已监听 :53` → `配网热点已开启：AI-PASSPORT-TSL` → REPL 就绪，无 panic/警告（日志：`logs\peek.log`）。**手机侧「门户弹窗 → 填 VIN → 保存重启」全流程待用户实测**。
+
 **四项优化实机复验（第五次刷写，2026-10-03）**：①RKE 白名单闸门 —— `rke 7` 被 console 层拒绝、零 BLE 写入；②deviceId 直连 —— 复位后 t≈0.3 s 按 MAC 命中并发起连接；③SMP 错误码可读化 —— 新文案生效（但 64 B 栈缓冲截断，已修待第六次刷写）；④counter 可观测性 —— `status` 回显盘上 counter。证据：`logs\opt-verify-1.log`、`opt-verify-2.log`。
 
 > **⚠ 顺序纠正：本车实测必须「先 `bind` 后 `handshake`」**（原卡把会话握手写在绑定之前，是错的）。未绑定时握手拿不到可用会话，`probe` 也只会报「没有 session_info_tag」；绑定成功后再握手才两域全 `OK`。
@@ -339,6 +348,13 @@ python -m esptool --chip esp32c3 -p COMx --baud 921600 --before default_reset --
 - **RKE**：`rke` 自带「未握手就先握手」，但**发指令前仍要按 §5.7/§8.3 核对动作号与明文载荷，逐条取得授权**。已验 `LOCK(1)/1001`；待验 `UNLOCK(0)/1000` 与 29/30（依车辆固件版本可能不支持，失败文案要可读）。
 - **鲁棒性**：拉黑距离/断电 → 观察自动重连；重启 → counter 不回退；重复绑定请求的幂等。
 
+**绑定前 checklist（引导页扫码侧，第 28 次用户实机选非 Tesla 设备超时教训）**：
+1. **关手机蓝牙**：车辆 BLE 钥匙连接数通常限 3，手机蓝牙开着会占掉一个槽位，设备连不上或被挤掉
+2. **坐进车内唤醒车机**：车休眠时**不广播** VCSEC 服务 UUID（`0211`/`0212`/`0213`），引导页扫描结果里全是灰色、**没有任何青色疑似车标记**（因为 `tesla=false`）
+3. **等扫描出青色圆点再选**：青色圆点 = 该广播带 Tesla VCSEC UUID（不是靠名字匹配），这是唯一可靠的 Tesla 标识；如果扫了 10 秒还没有青色圆点，说明车没广播 VCSEC，回到第 2 步
+4. **非 Tesla 设备选了必超时**：服务发现超时（8 秒，`GATT_PROC_MS=8000`）是**正常行为**——非 Tesla 设备根本没有 0211 服务，设备找不到就显示「失败:服务发现超时」
+5. **车广播名不带 "Tesla " 前缀是正常的**：新版固件用哈希名（如 `S4adfe3eacbdb58b7C`）或车主自定义名，不以 "Tesla " 开头也能扫到青色圆点；只有老版固件广播名才是 `Tesla ABC123` 格式
+
 ### 7.4 判读资料
 `FAULT_*`、`OperationStatus_E`、`WhitelistOperation_information_E` 三张判读表：`tesla-ble-probe\README.md` §4（含「出现时该怎么办」）。固件日志全中文、无数字错误码——与探针文案逐字一致，可直接套用该判读表。
 
@@ -359,7 +375,7 @@ python -m esptool --chip esp32c3 -p COMx --baud 921600 --before default_reset --
 | --- | --- | --- |
 | `scan` | `TLB_CMD_SCAN_LIST` | 20 s 全部广播列表（实测板端已扫到周围设备） |
 | `connect [VIN]` | 带 VIN→`TLB_CMD_CONNECT_VIN`，否则 `TLB_CMD_CONNECT_AUTO` | **第五次刷写后 AUTO 路径已对本车可用**（按 NVS deviceId + `ADDR_TYPE_ANY` 命中，§4.1）；无档案且 NVS 无 VIN 时 `active_vin()` 返回空串，需先 `vin <VIN>` |
-| `vin [17位]` | 读/写 `tlb_nvs_vin_save` | 单独一格，换车、清档案都不丢 |
+| `vin [17位]` | 读/写 `tlb_nvs_vin_save` | 单独一格，换车、清档案都不丢。**2026-10-09 配网热点上线后**：无 VIN 开机走网页配网为主通道（保存 → 写 NVS → 2 秒后自动重启进正常模式），REPL `vin` 保留为开发通道（正常模式下落盘即生效，不重启） |
 | `handshake` | `TLB_CMD_HANDSHAKE` | 两域各强制握手一次 |
 | `bind` | `TLB_CMD_BIND` | 未连接时直接报「还没连上车辆，先按扫描并连接」 |
 | `probe` / `version` | `TLB_CMD_PROBE` / `TLB_CMD_VERSION` | 只读 |

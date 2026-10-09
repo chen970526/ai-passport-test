@@ -180,6 +180,7 @@ typedef enum {
     TLB_ONB_PAIRING,     // 已发加钥匙请求，等车主刷 NFC 卡授权
     TLB_ONB_DONE,        // 绑定成功（停留约 2 秒后自动回首页）
     TLB_ONB_FAIL,        // 连接/绑定失败（onb_note 带原因，可重选/重扫）
+    TLB_ONB_NOVIN,       // 设备里没有 VIN：热点配网页引导（见 vin_cfg.c），存好 VIN 自动离开
 } tlb_onb_stage_t;
 
 typedef struct {
@@ -204,6 +205,7 @@ typedef struct {
     uint8_t onb_pages;                      // 总页数
     int64_t onb_at;                         // 当前阶段置位时刻
     char onb_note[TLB_ONB_NOTE_MAX];        // 阶段附注（正在连接的名字 / 失败原因）
+    char onb_vin[18];                       // 当前生效 VIN（NVS，空=未配置；引导页列表上方展示）
     tlb_onb_item_t onb_list[TLB_ONB_LIST_MAX];
     bool fac_reset;                         // 组合键出厂重置进行中（屏幕显示重置提示直到重启）
 } tlb_app_ui_t;
@@ -237,3 +239,6 @@ void tlb_app_post_vin(const char *vin);
 // 首次绑定引导：模式开关查询（app_main 按键分流用）与列表光标移动（任意任务可调）。
 bool tlb_app_onboarding(void);
 void tlb_app_onb_move(int delta);
+// 引导页右三单击（按键任务直调，不走命令队列）：PAIRING 中 worker 正阻塞在绑定
+// 循环里，队列命令无人出列——必须像 onb_move 一样直接置标志，由绑定循环消费。
+void tlb_app_onb_press(void);

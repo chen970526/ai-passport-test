@@ -38,6 +38,7 @@
 #include "esp_system.h" // esp_restart（出厂重置）
 
 #include "tesla_ble/tlb_ble.h"
+#include "vin_cfg.h" // 无 VIN 时的「接入点 + 内网网页」配网通道
 
 #include "tesla_core/tlb_bind.h"
 #include "tesla_core/tlb_dispatch.h"
@@ -114,6 +115,7 @@ static tlb_v3_session_t s_sess[2];    // [0]=VCSEC(2) [1]=INFOTAINMENT(3) ——
 static tlb_dispatch_ops_t s_ops;      // 注入给 core 的设备钩子
 static tlb_dispatch_scratch_t s_scratch; // 约 4KB，绝不上任务栈
 static char s_vin[TLB_VIN_MAX];       // 对应 state.vin（手输 / 档案回灌）
+static bool s_cfg_mode;               // 纯配网模式：蓝牙栈/worker/link 全没起，只有热点
 static tlb_profile_t s_profile;       // 对应 bind-profile.js 的 bind 对象
 static SemaphoreHandle_t s_state_mtx;
 
@@ -137,6 +139,7 @@ static struct {
     tlb_onb_item_t list[TLB_ONB_LIST_MAX];
 } s_onb_pub;                      // worker 写 / LVGL 读，整块拷贝时进临界区
 static bool s_onb_active;         // 引导模式总开关（绑定成功后 worker 延时关闭）
+static volatile bool s_onb_confirm; // 引导页 PAIRING 中右三「我已确认」，绑定循环消费
 static volatile int s_onb_cursor; // 光标真值（按键任务写，worker 读）
 static tlb_ble_dev_t s_onb_raw[TLB_APP_ADV_MAX]; // 引导扫描原始记录仓（worker 专用，
                                                  // SELECT 连接时要用原始地址字节）
@@ -1147,12 +1150,18 @@ static void onb_publish_window(void)
     portEXIT_CRITICAL(&s_onb_mux);
 }
 
-// 连接/绑定进行中不接受重扫与重复选择，避免打断加钥匙的时序窗口
-static bool onb_busy(void)
+static uint8_t onb_stage(void)
 {
     portENTER_CRITICAL(&s_onb_mux);
     uint8_t st = s_onb_pub.stage;
     portEXIT_CRITICAL(&s_onb_mux);
+    return st;
+}
+
+// 连接/绑定进行中不接受重扫与重复选择，避免打断加钥匙的时序窗口
+static bool onb_busy(void)
+{
+    uint8_t st = onb_stage();
     return st == TLB_ONB_CONNECTING || st == TLB_ONB_PAIRING;
 }
 
@@ -1175,6 +1184,12 @@ static void handle_onb_rescan(void)
     }
     if (onb_busy()) {
         tlb_ble_log(TLB_LOG_WARN, "引导：正在连接或等待刷卡，忽略重扫");
+        return;
+    }
+    if (active_vin()[0] == '\0') {
+        // 正常模式不可能无 VIN（无 VIN 开机即进配网模式，蓝牙栈根本不会起）。
+        // 真走到这里说明状态异常：绝不能带着蓝牙开热点（内存必炸），只提示重启。
+        tlb_ble_log(TLB_LOG_WARN, "引导：无VIN，忽略扫描（重启可进配网模式补填）");
         return;
     }
     onb_publish(TLB_ONB_SCAN, NULL);
@@ -1249,6 +1264,15 @@ static bool onb_vin6_of(const char *name, char *out6)
     return false;
 }
 
+// 消费一次「我已确认」标志（传给 tesla_core 绑定循环，每个时间片检查一次）
+static bool onb_user_confirm(void)
+{
+    bool v = s_onb_confirm;
+    s_onb_confirm = false;
+    return v;
+}
+static const tlb_bind_opts_t s_onb_bind_opts = { .user_confirm = onb_user_confirm };
+
 // 引导选车：连接 raw 列表光标所指车辆 → 自动发加钥匙请求 → 等车主刷 NFC 卡。
 // 复用 connect_and_record（连接+落盘档案）与 handle_bind 同款绑定链路。
 static void handle_onb_select(void)
@@ -1257,7 +1281,14 @@ static void handle_onb_select(void)
         return;
     }
     if (onb_busy()) {
-        tlb_ble_log(TLB_LOG_WARN, "引导：正在连接或等待刷卡，忽略重复选择");
+        // PAIRING 中右三 =「我已确认，立即验证」：置标志，绑定循环下个时间片（≤2.5s）
+        // 立刻打一针 —— 通过马上进成功收尾；没通过立刻报可读失败，不再空等 150 秒。
+        if (onb_stage() == TLB_ONB_PAIRING) {
+            s_onb_confirm = true;
+            tlb_ble_log(TLB_LOG_INFO, "引导：用户已确认，立即验证绑定结果");
+        } else {
+            tlb_ble_log(TLB_LOG_WARN, "引导：正在连接，忽略重复选择");
+        }
         return;
     }
     if (s_onb_n <= 0) {
@@ -1275,14 +1306,29 @@ static void handle_onb_select(void)
     snprintf(note, sizeof(note), "%s", it.name[0] ? it.name : it.id);
     char vin6[8];
     bool has_vin = onb_vin6_of(it.name, vin6);
+    // 会话握手 HMAC 的 personalization 用**全量 VIN**（tlb_v3_session_info_hmac），
+    // 哈希广播名（新固件改名车）拿不到 VIN 时必须用配网页/串口存下的那条，
+    // 否则 session_info tag 永远校验不过（表现：车端能加钥匙，但探针/解锁全失败）。
+    const char *stored_vin = active_vin();
+    size_t sv_len = strlen(stored_vin);
+    const char *bind_vin = NULL;
+    if (has_vin) {
+        // 广播名带后 6 位：与存档 VIN 尾号一致就用全量，不一致说明选了另一台车
+        bind_vin = (sv_len >= 6 && strcmp(stored_vin + sv_len - 6, vin6) == 0) ? stored_vin : vin6;
+    } else if (sv_len > 0) {
+        bind_vin = stored_vin;
+    }
+    if (bind_vin == NULL) {
+        onb_publish(TLB_ONB_FAIL, "无VIN：先连接入点配置");
+        return;
+    }
 
     // 还没连上车（首次选择/上次连接失败）才发起连接；绑定失败重选时车还连着，
     // 直接重发加钥匙请求，不做无谓的断连重连。
     if (!tlb_ble_connected()) {
         onb_publish(TLB_ONB_CONNECTING, note);
         char err[160];
-        if (!connect_and_record(has_vin ? vin6 : "", &s_onb_raw[s_onb_raw_idx[sel]], err,
-                                sizeof(err))) {
+        if (!connect_and_record(bind_vin, &s_onb_raw[s_onb_raw_idx[sel]], err, sizeof(err))) {
             onb_publish(TLB_ONB_FAIL, err[0] ? err : "连接失败，请重试");
             return;
         }
@@ -1297,14 +1343,12 @@ static void handle_onb_select(void)
     sb_log(TLB_LOG_INFO, &sb);
     onb_publish(TLB_ONB_PAIRING, note);
 
-    // 哈希名/改名车拿不到 VIN 后 6 位：占位 "000000" 只喂给绑定守卫与预探针
-    // （VCSEC 会话按公钥走，占位值不参与任何加解密）；档案 VIN 留空，回连按 MAC。
-    const char *bind_vin = has_vin ? vin6 : "000000";
     if (ensure_key(bind_vin)) {
         tlb_ble_log(TLB_LOG_INFO, "已生成本机密钥对，接着把公钥交给车辆");
     }
     memset(&s_br, 0, sizeof(s_br));
-    tlb_bind_key(bind_vin, NULL, &s_sess[0], &s_ops, &s_scratch, &s_br);
+    s_onb_confirm = false; // 丢弃上一轮可能残留的确认标志
+    tlb_bind_key(bind_vin, &s_onb_bind_opts, &s_sess[0], &s_ops, &s_scratch, &s_br);
     tlb_ble_log(s_br.ok ? TLB_LOG_OK : TLB_LOG_ERROR, s_br.text);
     if (s_br.ok && s_br.paired) {
         mark_bound();
@@ -1554,6 +1598,7 @@ void tlb_app_ui_snapshot(tlb_app_ui_t *out)
         out->onb_list[i] = s_onb_pub.list[i];
     }
     portEXIT_CRITICAL(&s_onb_mux);
+    snprintf(out->onb_vin, sizeof(out->onb_vin), "%.17s", active_vin());
     out->fac_reset = s_fac_reset;
 }
 
@@ -1672,9 +1717,29 @@ void tlb_app_post_vin(const char *vin)
     up[j] = '\0';
     snprintf(s_vin, sizeof(s_vin), "%s", up);
     tlb_nvs_vin_save(up); // config/index.js:VIN_STORE —— 换车、清档案都不丢
+
+    if (s_cfg_mode) {
+        // 配网模式（蓝牙栈根本没起，热恢复无从谈起）：请求 vin_cfg 延时 2 秒重启。
+        // 重启后 VIN 已在 NVS → 走正常模式：开蓝牙、热点不再开（用户规则）。
+        vin_cfg_stop();
+        return;
+    }
+    // 正常模式 = 只可能是串口 REPL 换/补 VIN：落盘即生效，后续命令自然用新值。
 }
 
 bool tlb_app_onboarding(void) { return s_onb_active; }
+
+// 引导页右三单击：PAIRING 中直接置「我已确认」标志（按键任务上下文，只动一个
+// volatile bool，与 onb_move 同款做法）；其余阶段照常入队走选车流程。
+void tlb_app_onb_press(void)
+{
+    if (onb_stage() == TLB_ONB_PAIRING) {
+        s_onb_confirm = true;
+        tlb_ble_log(TLB_LOG_INFO, "引导：用户已确认，立即验证绑定结果");
+        return;
+    }
+    tlb_app_post(TLB_CMD_ONB_SELECT, 0);
+}
 
 // 引导列表光标移动：按键任务直接调（只动一个 int），LVGL 侧经快照看到
 void tlb_app_onb_move(int delta)
@@ -1715,9 +1780,6 @@ esp_err_t tlb_app_init(void)
     s_ops.mtu_note = op_mtu_note;
     s_ops.log = op_log;
 
-    // 失败不中止：函数自带错误日志行，后续命令会各自撞上「栈没起」的等价提示
-    tlb_ble_stack_start();
-
     s_state_mtx = xSemaphoreCreateMutex();
     s_cmd_q = xQueueCreate(TLB_APP_CMD_Q_LEN, sizeof(cmd_msg_t));
     s_link_wake = xSemaphoreCreateCounting(8, 0);
@@ -1726,6 +1788,24 @@ esp_err_t tlb_app_init(void)
     load_profile(); // bind-profile.js:loadBind（含设备侧播种）
     load_sessions(); // v3-session-store.js:v3Session 的读盘分支
     sync_signer_ops();
+
+    // 用户规则（内存只够一条链路）：设备里没有 VIN（哈希广播名拿不到，只能用户填）
+    // → 进「纯配网模式」：只留屏幕提示页 + AP + DHCP + DNS + HTTP，蓝牙栈与
+    // worker/link 任务一律不启动（实测 BLE 栈吃掉 ~105KB，热点必死）。
+    // VIN 存进 NVS 后 vin_cfg 延时 2 秒重启；重启后走到下面的正常模式。
+    if (active_vin()[0] == '\0') {
+        s_cfg_mode = true;
+        s_onb_active = true;
+        if (!vin_cfg_start()) {
+            onb_publish(TLB_ONB_FAIL, "AP启动失败 见串口");
+        } else {
+            onb_publish(TLB_ONB_NOVIN, NULL);
+        }
+        return ESP_OK;
+    }
+
+    // 失败不中止：函数自带错误日志行，后续命令会各自撞上「栈没起」的等价提示
+    tlb_ble_stack_start();
 
     // core 的栈预算（tlb_dispatch.c / tlb_bind.c 头部注释里 gcc -fstack-usage 实测）最深链约
     // 12.0KB，再叠上本层帧与 newlib printf，12KB 会被 bind 打穿（真机 Stack protection fault）。
@@ -1737,7 +1817,7 @@ esp_err_t tlb_app_init(void)
     tlb_app_post(TLB_CMD_LOOP_START, 0);
     // 首次绑定引导：无密钥或无档案（社区新用户刷机后第一次开机）→ 自动进引导页，
     // 全程不用输 VIN；已绑定的老板子照常自动连车，引导不出场。串口 forget/wipe
-    // 后重启也会重新走到这里。
+    // 后重启也会重新走到这里（无 VIN 时先被上面的配网分支截住）。
     if (!op_has_key(NULL) || !has_bind()) {
         s_onb_active = true;
         tlb_app_post(TLB_CMD_ONB_RESCAN, 0);

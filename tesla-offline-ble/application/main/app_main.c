@@ -73,7 +73,7 @@ static void on_btn(bsp_btn_t btn, bsp_btn_ev_t ev, void *user)
         } else if (btn == BTN_RIGHT2 && ev == BSP_BTN_CLICK) {
             tlb_app_onb_move(1); // 右二 = 光标下移
         } else if (btn == BTN_RIGHT3 && ev == BSP_BTN_CLICK) {
-            tlb_app_post(TLB_CMD_ONB_SELECT, 0); // 右三单击 = 连接光标所指车辆
+            tlb_app_onb_press(); // 右三单击 = 连接光标所指车辆；PAIRING 中 = 我已确认
         } else if (btn == BTN_RIGHT3 && ev == BSP_BTN_DOUBLE) {
             tlb_app_post(TLB_CMD_ONB_RESCAN, 0); // 右三双击 = 重新扫描
         }

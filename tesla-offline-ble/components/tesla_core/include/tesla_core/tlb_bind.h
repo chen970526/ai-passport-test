@@ -41,6 +41,10 @@ typedef struct {
     uint32_t form_factor; // has_form_factor=false 时用 TLB_FF_ANDROID_DEVICE
     bool has_form_factor;
     bool force; // 仅 probe_enrollment：忽略现成会话，强行打一针
+    // 引导页「我已确认」按钮（设备层注入，消费式：按下后首次调用返回 true 并清标志）。
+    // bindKey 等待循环每个时间片检查：按下 → 立即打一针 —— 通过马上成功返回；
+    // 未通过立即结束等待返回可读失败，不再空耗剩余窗口（用户可贴卡后再按重试）。
+    bool (*user_confirm)(void);
 } tlb_bind_opts_t;
 
 // 探针 probeOnce 的返回形状

@@ -95,6 +95,59 @@ idf.py -C tesla-offline-ble -p COMx monitor
 
 **出问题怎么办**：端口打不开 → 回步骤 0 现查；`Connecting...` 超时 → 关掉占用串口的程序、重插 USB；刷完 `keyId` 变了 → 用步骤 3 的备份 `write_flash 0x9000` 写回。完整故障处置表见 [tesla-key-context.md](tesla-key-context.md) §7.8。
 
+### 首次使用：VIN 配网热点（无电脑，手机操作）
+
+新固件车广播名是哈希，BLE 拿不到 VIN，而会话握手 HMAC 必须用**全量 17 位 VIN** —— 所以设备里没有 VIN 时（首次开机 / 出厂重置后）会自动进入**纯配网模式**：
+
+1. 屏幕显示三步指引：连热点 **`AI-PASSPORT-TSL`** → 密码 **`87654321`**（印在屏幕上）→ 打开 **http://192.168.4.2** 填 VIN。手机连上热点后通常会自动弹出该页面（DNS 劫持 + 门户提示），不弹窗就手动开浏览器输地址。
+2. 网页填 17 位 VIN（不含 I/O/Q）保存 → 写入 NVS → 设备 2 秒后**自动重启**，热点随之关闭，进入正常模式（蓝牙启动，回到绑定引导）。
+3. VIN 只走手机直连热点的局域网，热点不联网、不出网。
+
+要点（内存所限，C3 只够一条链路）：配网模式下**蓝牙栈、worker/link 任务全不启动**，只留屏幕 + AP + DHCP + DNS + HTTP；保存后靠重启切换模式，不做运行中热切换。热点**只在没有 VIN 时开启**，VIN 存好即关。串口 REPL 的 `vin <17位>` 命令保留为开发通道。若屏幕显示「AP启动失败 见串口」，串口日志里有错误码与空闲堆数值。
+
+### 构建与分发：两种玩法
+
+嵌入式固件没有 APK 那种"双击安装"的产物，最终程序就是编译出的 `.bin` 镜像文件（在 `tesla-offline-ble\build\` 下）。按用途分两种打包方式：
+
+**① 给自己：分段 build + 分段刷（保绑定，日常更新用这个）**
+
+自己的钥匙已经绑好车，刷新版本**绝不能碰 NVS（`0x9000`）**，所以走分件路线 —— 就是上面「刷机步骤」的步骤 2→3→4：
+
+```powershell
+idf.py -C tesla-offline-ble build          # 编译，产物在 build\ 下
+idf.py -C tesla-offline-ble -p COMx flash  # 只写 0x0 / 0x8000 / 0x10000，不碰 0x9000
+```
+
+日常只改了应用代码（没动分区表/sdkconfig）时可用更快的 `idf.py -C tesla-offline-ble -p COMx app-flash`（只写 `0x10000`）。刷前照旧备份 NVS（步骤 3）。
+
+**② 给别人：整合 build 出单文件（对方无需源码、无需 ESP-IDF）**
+
+把三个 bin 合并成**一个整片镜像**，只发这一个文件。固件不含设备密钥（密钥是板子绑定时生成、存在 NVS 里的），可以放心外发。
+
+你这边（仓库根 PowerShell，先按步骤 1 激活 IDF、按 ① 完成 build）：
+
+```powershell
+idf.py -C tesla-offline-ble merge-bin -o "$PWD\tesla-offline-ble\build\tesla-offline-ble-full.bin"
+```
+
+产物 `tesla-offline-ble\build\tesla-offline-ble-full.bin` 就是"APK"，发给对方即可。
+
+对方刷机（只需 Python，装个 esptool：`pip install esptool`）：
+
+```powershell
+python -m esptool --chip esp32c3 -p COMx --baud 921600 --before default_reset --after hard_reset write_flash 0x0 tesla-offline-ble-full.bin
+```
+
+`COMx` 是对方电脑上板子的端口（认 `USB\VID_303A&PID_1001` 现查）；同样不用按 BOOT 键。
+
+> ⚠ **单文件 `write_flash 0x0` 会把 NVS 一起擦成空** —— 新板子无所谓（拿到后人和实体 NFC 卡在车边 `bind` 一次即可），但**绝不能用它刷你自己这把已绑好的钥匙**。想稳妥就改发三个文件（`build\bootloader\bootloader.bin`、`build\partition_table\partition-table.bin`、`build\tesla-offline-ble.bin`），让对方执行：
+>
+> ```powershell
+> python -m esptool --chip esp32c3 -p COMx --baud 921600 --before default_reset --after hard_reset write_flash 0x0 bootloader.bin 0x8000 partition-table.bin 0x10000 tesla-offline-ble.bin
+> ```
+>
+> 这条只写三个区间、**不碰 NVS**，和 ① 的 `idf.py flash` 等效。
+
 ---
 
 ## 二、tesla-ble-probe（uni-app 探针）
