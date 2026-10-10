@@ -32,6 +32,10 @@ def run(mode: str) -> int:
            "--source-url", SOURCE_URL]
     if mode == "auto":
         cmd.append("--auto")
+    if mode == "update":
+        # 更新已有玩法 1149：必须用官网「更新入口」签发的 update_once 授权码
+        # （whoami 需显示 scope=update_once 且 projectId=1149），否则会误建重复玩法
+        cmd += ["--project-id", "1149", "--auto"]
     return subprocess.call(cmd)
 
 
