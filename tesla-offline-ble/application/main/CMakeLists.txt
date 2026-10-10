@@ -3,7 +3,6 @@
 # 基线 ai-passport/main 依旧不动；bsp 组件只读复用（显示/背光/ADC 三键）。
 idf_component_register(
     SRCS "tlb_app.c"
-         "tlb_console.c"
          "key_ui.c"
          # 图标 L8 遮罩数组由 tools/gen_key_icons.py 从 UI_SPEC 资源包 PNG 生成
          "key_icons.c"
@@ -15,4 +14,4 @@ idf_component_register(
          "../../assets/fonts/key_font_14.c"
     INCLUDE_DIRS "."
     REQUIRES tesla_ble tesla_core bsp
-    PRIV_REQUIRES nvs_flash esp_timer bt console esp_wifi esp_http_server esp_netif)
+    PRIV_REQUIRES nvs_flash esp_timer bt esp_wifi esp_http_server esp_netif)

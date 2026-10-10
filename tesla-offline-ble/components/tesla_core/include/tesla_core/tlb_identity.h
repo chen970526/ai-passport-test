@@ -15,7 +15,7 @@
 // 广播名上限：车端实际最长的是 "S" + 16 hex = 17，留一倍余量给车主自改的名字。
 #define TLB_ADV_NAME_MAX 32
 // 服务 UUID 字符串形式（128 位全写 36 字符 + 结尾；短格式 4 字符）
-#define TLB_UUID_STR_MAX 40
+#define TLB_UUID_STR_MAX 44 // 32 位 UUID 展开是 12+4+4+4+12=40 字符+结尾符，40 会截断
 
 typedef struct {
     // 新车型："Tesla " + VIN 后 6 位。长度不足 6 时为空串 = 这条规则不成立。

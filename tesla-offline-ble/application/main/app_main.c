@@ -14,36 +14,14 @@
 
 static const char *TAG = "tlb";
 
-void tlb_console_start(void); // tlb_console.c
 
 // ---------------------------------------------------------------- 按键映射
 // 三键共用 GPIO0 一路 ADC（分压窗口见 bsp_pins.h），物理顺序「右一/右二/右三」
-// 与 UP/DOWN/OK 的对应关系待实机确认：按下任键串口会打印「键=UP/DOWN/OK」，
-// 若与屏幕预期不符，只改这三行 #define 即可。
+// 与 UP/DOWN/OK 的对应关系已实机确认。按键不再打串口日志（刷屏日志页），
+// 排障看诊断页1「键=N」计数与屏幕按键反馈。
 #define BTN_RIGHT1 BSP_BTN_UP   // 右一 = 上锁（RKE 1）
 #define BTN_RIGHT2 BSP_BTN_DOWN // 右二 = 解锁 + 启动授权（RKE 0 → 20）
 #define BTN_RIGHT3 BSP_BTN_OK   // 右三 = 单击前备箱 / 双击后备箱 / 长按切诊断
-
-static const char *btn_name(bsp_btn_t b)
-{
-    switch (b) {
-    case BSP_BTN_UP: return "UP";
-    case BSP_BTN_DOWN: return "DOWN";
-    case BSP_BTN_OK: return "OK";
-    default: return "?";
-    }
-}
-
-static const char *ev_name(bsp_btn_ev_t ev)
-{
-    switch (ev) {
-    case BSP_BTN_PRESS: return "按下";
-    case BSP_BTN_CLICK: return "单击";
-    case BSP_BTN_DOUBLE: return "双击";
-    case BSP_BTN_LONG: return "长按";
-    default: return "?";
-    }
-}
 
 // 组合键回调（运行在按键 esp_timer 任务）：只入队出厂重置命令，真正的清除
 // 在 worker 任务串行执行。社区用户无需串口即可重置设备换车绑定。
@@ -60,18 +38,40 @@ static void on_combo_factory(void *user)
 static void on_btn(bsp_btn_t btn, bsp_btn_ev_t ev, void *user)
 {
     (void)user;
-    ESP_LOGI(TAG, "按键 %s %s", btn_name(btn), ev_name(ev));
+    // 不再打印「按键 X 单击」日志：按键事件会刷屏日志环形缓冲，把真正的
+    // 业务日志挤掉（2026-10-10 用户实机反馈）。排障改用诊断页1「键=N」计数
+    // + 屏幕按键反馈（key_ui_notify_btn），两者都不产生日志。
     key_ui_notify_btn(btn);
     if (btn == BTN_RIGHT3 && ev == BSP_BTN_LONG) {
         // 右三长按 = 屏幕诊断模式开关（无电脑时排查按键链路，见 key_ui.c）；
         // 引导模式下同样生效，方便新用户开箱时排查按键
         key_ui_toggle_diag();
+    } else if (key_ui_in_diag()) {
+        // 诊断模式内按键按页分流（必须排在引导分支之前，第 30 次修复）：
+        // 页1：右三单击=进页2，其余吞掉；
+        // 页2：右一/右二=上下滚动日志，右三单击=回页1，双击吞掉。
+        if (btn == BTN_RIGHT3 && ev == BSP_BTN_CLICK) {
+            key_ui_diag_next_page();
+        } else if (key_ui_diag_page() == 1 && btn == BTN_RIGHT1 && ev == BSP_BTN_CLICK) {
+            key_ui_diag_scroll(-1);
+        } else if (key_ui_diag_page() == 1 && btn == BTN_RIGHT2 && ev == BSP_BTN_CLICK) {
+            key_ui_diag_scroll(1);
+        }
     } else if (tlb_app_onboarding()) {
         // 首次绑定引导模式：三键临时改作列表导航，绑定完成后自动恢复常态映射
-        if (btn == BTN_RIGHT1 && ev == BSP_BTN_CLICK) {
+        if (tlb_app_onb_rescan_pending()) {
+            // 重扫确认弹窗（右一长按唤出）：右三单击=是，立刻重扫；其余单击=取消
+            if (btn == BTN_RIGHT3 && ev == BSP_BTN_CLICK) {
+                tlb_app_post(TLB_CMD_ONB_RESCAN, 0);
+            } else if (ev == BSP_BTN_CLICK || ev == BSP_BTN_DOUBLE) {
+                tlb_app_post(TLB_CMD_ONB_RESCAN_CANCEL, 0);
+            }
+        } else if (btn == BTN_RIGHT1 && ev == BSP_BTN_CLICK) {
             tlb_app_onb_move(-1); // 右一 = 光标上移（列表按信号强度排序）
         } else if (btn == BTN_RIGHT2 && ev == BSP_BTN_CLICK) {
             tlb_app_onb_move(1); // 右二 = 光标下移
+        } else if (btn == BTN_RIGHT1 && ev == BSP_BTN_LONG) {
+            tlb_app_post(TLB_CMD_ONB_RESCAN_ASK, 0); // 右一长按 = 重扫确认弹窗（防误触）
         } else if (btn == BTN_RIGHT3 && ev == BSP_BTN_CLICK) {
             tlb_app_onb_press(); // 右三单击 = 连接光标所指车辆；PAIRING 中 = 我已确认
         } else if (btn == BTN_RIGHT3 && ev == BSP_BTN_DOUBLE) {
@@ -115,15 +115,11 @@ void app_main(void)
         ESP_LOGE(TAG, "tlb_app_init failed");
     }
     key_ui_boot_stage(2); // BLE 核心就绪；若电池态阶停在 1，说明卡在 tlb_app_init
-    // 按键初始化排在 console 之前：console 走 USB-Serial-JTAG，纯电池时
-    // 没有主机，若它启动时阻塞，排在后面的按键初始化永远轮不到——
-    // 电池态「ADC失败:无」（驱动从未初始化）与此特征完全吻合。
     if (app_button_init(on_btn, NULL) != ESP_OK) {
-        ESP_LOGW(TAG, "按键初始化失败，只能靠串口命令操作");
+        ESP_LOGW(TAG, "按键初始化失败，设备不可操作");
     }
     // 组合键（先按住右三再按右一保持3秒）= 出厂重置，注册在按键就绪之后
     app_button_set_combo_cb(on_combo_factory, NULL);
     key_ui_boot_stage(3); // 按键初始化已返回；若电池态阶停在 2，说明卡在按键初始化内部
-    tlb_console_start();
-    key_ui_boot_stage(4); // 控制台已启动，主流程走完
+    key_ui_boot_stage(4); // 主流程走完
 }

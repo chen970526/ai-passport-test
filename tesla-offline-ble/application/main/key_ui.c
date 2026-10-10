@@ -89,9 +89,11 @@ static lv_obj_t *s_onb_vin6[TLB_ONB_LIST_MAX];    // 列表行：VIN 后 6 位�
 static lv_obj_t *s_onb_rssi[TLB_ONB_LIST_MAX];    // 列表行：信号强度
 static lv_obj_t *s_onb_vin;                       // 当前生效 VIN 行（步骤与列表之间）
 static lv_obj_t *s_onb_keys;                      // 底部按键说明
+static lv_obj_t *s_onb_qr;                        // 配网阶段二维码（直达 http://192.168.4.2）
 static bool s_onb_shown;                          // 引导页当前是否占屏
-static lv_obj_t *s_log_full; // 全屏日志页（页2 独占，进入时创建/退出时删除）
-static lv_obj_t *s_log_idx;  // 日志页底部的 "N/8" 位置指示
+static lv_obj_t *s_log_box;  // 页2 可滚动容器（单 label 全文，退出时删）
+static lv_obj_t *s_log_label; // 页2 日志正文（text 直接指向 s_log_text 堆缓冲，零拷贝）
+static lv_obj_t *s_log_idx;  // 日志页底部的操作提示行
 static bool s_log_shown;     // 日志页当前是否占屏（仅 LVGL 任务读写）
 static bool s_home_shown = true;   // 首页元素组当前是否可见
 static bool s_fb_shown;            // 反馈覆盖层当前是否占屏
@@ -107,14 +109,24 @@ static volatile int s_key_ev_count; // 开机至今收到的按键事件总数�
 
 // 屏幕诊断模式：长按右三切换。无电脑时用它肉眼排查按键链路——
 // 页1：按键线实时 ADC + 事件计数 + 剩余堆 + 连接 + 重启原因；
-// 页2（全屏日志页）：一次显示一条完整固件日志（自动换行不遮挡），
-// 右三单击在 8 条环形缓冲里逐条翻看（最新→最旧→回到最新）。
-#define LOG_RING_N   8
-#define LOG_RING_LEN 160
+// 页2（合并日志页）：最近 16 条日志拼成一屏、横线分隔，右一/右二上下滚动
+// （一次约 3 行），右三单击回页1。方便整屏拍照排查，不用逐条翻页。
+// 条数上限由 RAM 决定：C3 正常模式（BLE 运行中）空闲堆实测仅 ~11 KB，
+// 32 条版静态 .bss 多占 9.2 KB 直接把扫描饿死（列表整块变白、无结果，
+// 2026-10-10 用户实机回退），16×128B 是实测安全上限（静态净增 ~2.7 KB）。
+#define LOG_RING_N   16
+#define LOG_RING_LEN 128
+// 快照拼接缓冲（每条间插一行 ----- 分隔）。只在进入日志页那一刻从堆上申请、
+// 退出即释放。教训（2026-10-10 第 33 次，实车 logdump 铁证）：这 2.2KB 若静态
+// 常驻，叠加 ring 2KB + scratch 256B 共 ~4.5KB，把启动堆压到只剩 11KB，
+// NimBLE 连接期分配直接「BLE_INIT: Malloc failed」→ 车的回包收不到 → 重发
+// → 车踢线 → 绑定报「链路错误」，BLE 功能整体瘫痪。
+#define LOG_TEXT_CAP (LOG_RING_N * (LOG_RING_LEN + 8))
+static char *s_log_text;
 static volatile bool s_diag;
-static volatile int s_diag_page;     // 0=电压页 1=日志页
-static volatile int s_log_view_idx;  // 日志页当前看的是倒数第几条（0=最新）
-static volatile int s_boot_stage;    // app_main 走到第几步（诊断页1「阶=N」）
+static volatile int s_diag_page;      // 0=电压页 1=日志页
+static volatile int s_log_scroll_dir; // 页2 待处理滚动：-1 上移 +1 下移 0 无
+static volatile int s_boot_stage;     // app_main 走到第几步（诊断页1「阶=N」）
 
 void key_ui_boot_stage(int n)
 {
@@ -125,7 +137,6 @@ void key_ui_toggle_diag(void)
 {
     s_diag = !s_diag;
     s_diag_page = 0;
-    s_log_view_idx = 0;
 }
 
 void key_ui_diag_next_page(void)
@@ -133,12 +144,19 @@ void key_ui_diag_next_page(void)
     if (!s_diag) {
         return;
     }
-    if (s_diag_page == 0) {
-        s_diag_page = 1; // 页1 → 进全屏日志页，从最新一条看起
-        s_log_view_idx = 0;
-    } else {
-        s_log_view_idx = (s_log_view_idx + 1) % LOG_RING_N; // 日志页内翻下一条
+    s_diag_page = s_diag_page ? 0 : 1; // 页1 ↔ 页2 往返切换
+}
+
+void key_ui_diag_scroll(int dir)
+{
+    if (s_diag && s_diag_page == 1) {
+        s_log_scroll_dir = dir;
     }
+}
+
+int key_ui_diag_page(void)
+{
+    return s_diag ? s_diag_page : 0;
 }
 
 bool key_ui_in_diag(void)
@@ -291,7 +309,8 @@ static void set_home_visible(bool on)
 // 首次绑定引导页整组
 static void set_onb_visible(bool on)
 {
-    lv_obj_t *g[] = {s_onb_title, s_onb_step, s_onb_vin, s_onb_status, s_onb_keys, s_onb_panel};
+    lv_obj_t *g[] = {s_onb_title, s_onb_step, s_onb_vin, s_onb_status, s_onb_keys, s_onb_panel,
+                     s_onb_qr};
     set_group_visible(g, sizeof g / sizeof g[0], on);
 }
 
@@ -299,6 +318,8 @@ static void set_onb_visible(bool on)
 static const char *ONB_STEP_DEFAULT =
     "① 关闭手机蓝牙，车辆钥匙限3把\n② 坐进车内，唤醒车机\n③ 右一/右二选车，右三连接";
 static const char *ONB_STEP_PAIR = "车机弹出「添加钥匙」后\n请将NFC钥匙卡贴在\n中控杯架前的读卡区";
+// 重扫确认弹窗文案（右一长按唤出，防误触；操作指引直接写进弹窗，不另设控件）
+static const char *ONB_STEP_RESCAN = "重新搜索车辆？\n右三 = 是，立即重扫\n右一 / 右二 = 取消";
 // NOVIN 阶段：热点+内网网页配 VIN 的三步指引（文案用字均已在 14px 字库内；
 // SSID/密码/地址由 vin_cfg.h 宏拼出，改配置不用动这里）
 static char s_step_novin[128];
@@ -327,6 +348,8 @@ static void onb_render(const tlb_app_ui_t *u)
     // 列表行：配对/完成/配VIN阶段让位给刷卡指引、成功提示与配网三步曲
     bool list_show = (u->onb_stage != TLB_ONB_PAIRING && u->onb_stage != TLB_ONB_DONE &&
                       u->onb_stage != TLB_ONB_NOVIN);
+    // 配网二维码：只占用列表卡片区域，必须与列表互斥（其他阶段列表要用）
+    set_visible(s_onb_qr, u->onb_stage == TLB_ONB_NOVIN);
     for (int i = 0; i < TLB_ONB_LIST_MAX; i++) {
         bool show = list_show && i < (int)u->onb_count;
         set_visible(s_onb_row[i], show);
@@ -340,7 +363,7 @@ static void onb_render(const tlb_app_ui_t *u)
         } else {
             // 无名广播：显示地址尾部（"AA:BB:CC:DD:EE:FF" → "…DD:EE:FF"）
             size_t idl = strlen(it->id);
-            snprintf(nm, sizeof(nm), "…%s", idl > 8 ? it->id + idl - 8 : it->id);
+            snprintf(nm, sizeof(nm), "…%.8s", idl > 8 ? it->id + idl - 8 : it->id);
         }
         set_text(s_onb_name[i], nm);
         bool sel = (i == (int)u->onb_cursor);
@@ -405,7 +428,7 @@ static void onb_render(const tlb_app_ui_t *u)
     case TLB_ONB_NOVIN:
         if (s_step_novin[0] == '\0') {
             snprintf(s_step_novin, sizeof(s_step_novin),
-                     "①连WiFi:%s\n②密码:%s\n③打开 %s 填VIN", VIN_AP_SSID,
+                     "①连WiFi:%s\n②密码:%s\n③扫码或打开 %s", VIN_AP_SSID,
                      VIN_AP_PASS, VIN_AP_IP);
         }
         snprintf(st, sizeof(st), "等待配置 VIN…");
@@ -413,19 +436,26 @@ static void onb_render(const tlb_app_ui_t *u)
         step = s_step_novin;
         break;
     case TLB_ONB_FAIL:
-    default: {
-        char why[24];
-        utf8_cut(u->onb_note, why, sizeof(why), 18);
-        snprintf(st, sizeof(st), "失败:%s", why);
+    default:
+        // 状态行只给一句短提示；失败原因整段搬进上方步骤区（3 行自动换行），
+        // 不再 utf8_cut 到 18 字节——之前「失败:AI-passport 已发」就是截断截没了。
+        snprintf(st, sizeof(st), "失败：原因见上方");
         col = C_ERR;
+        step = u->onb_note[0] != '\0' ? u->onb_note : "绑定未完成，请靠近车辆重试";
         break;
     }
+    // 重扫确认弹窗：列表留在原位（用户看得见当前选了谁），只把步骤区换成确认文案
+    if (u->onb_stage == TLB_ONB_RESCAN_ASK) {
+        snprintf(st, sizeof(st), "重新搜索车辆？");
+        col = C_WARN;
+        step = ONB_STEP_RESCAN;
     }
     set_text(s_onb_status, st);
     lv_obj_set_style_text_color(s_onb_status, lv_color_hex(col), 0);
     set_text(s_onb_step, step);
     lv_obj_set_style_text_color(s_onb_step, lv_color_hex(
-        (step == ONB_STEP_PAIR || step == s_step_novin) ? C_WARN : C_DIM), 0);
+        (step == ONB_STEP_PAIR || step == s_step_novin || step == ONB_STEP_RESCAN) ? C_WARN :
+        (u->onb_stage == TLB_ONB_FAIL ? C_ERR : C_DIM)), 0);
     // VIN 行：显示当前生效值（来自 NVS）；配网模式未配置时留空
     char vb[24];
     if (u->onb_vin[0] != '\0') {
@@ -434,9 +464,12 @@ static void onb_render(const tlb_app_ui_t *u)
     } else {
         set_text(s_onb_vin, "");
     }
-    // 底部只保留配对中的确认提示（右三 = 立即验证绑定结果），其余阶段留空
+    // 底部提示行：配对中=立即验证；列表/失败=右一长按重扫（此前重扫零提示，
+    // 用户根本不知道能重新检索——列表不实时，没靠近车时扫不到必须给出口）
     set_text(s_onb_keys,
-             u->onb_stage == TLB_ONB_PAIRING ? "右三=已确认，立即验证" : "");
+             u->onb_stage == TLB_ONB_PAIRING ? "右三=已确认，立即验证"
+             : (u->onb_stage == TLB_ONB_LIST || u->onb_stage == TLB_ONB_FAIL)
+                   ? "右一长按=重新搜索" : "");
 }
 
 // RKE 成功文案。动作号语义以 tlb_types.h 的 RKEAction_E 为准：
@@ -466,39 +499,86 @@ static void ui_tick(lv_timer_t *timer)
 {
     (void)timer;
 
-    // 全屏日志页（诊断页2）：整屏只放一条完整日志，自动换行、绝不遮挡。
-    // 进出时整体隐藏/恢复首页元素；页内右三单击逐条翻看。
+    // 合并日志页（诊断页2）：进入瞬间从环形缓冲拍 8 条快照，页内内容固定不变
+    // ——按键/滚动自身也会产生日志，实时刷新的话正在看的行会被新条目顶走，
+    // 没法滚动也没法拍照（2026-10-10 用户实机反馈）。退出再进 = 新快照。
+    // 页2 内右一/右二滚动、右三单击回页1。
     const bool logpage = s_diag && (s_diag_page == 1);
     if (logpage != s_log_shown) {
         s_log_shown = logpage;
         if (logpage) {
             lv_obj_t *parent = lv_obj_get_parent(s_tesla); // 屏幕根容器
-            s_log_full = add_label(parent, MARGIN_X, MARGIN_Y, LCD_W - 2 * MARGIN_X,
-                                   LCD_H - 2 * MARGIN_Y - 22, &key_font_14, C_INK, "");
-            lv_label_set_long_mode(s_log_full, LV_LABEL_LONG_WRAP);
-            lv_obj_set_style_text_align(s_log_full, LV_TEXT_ALIGN_LEFT, 0);
+            s_log_box = lv_obj_create(parent);
+            lv_obj_set_pos(s_log_box, MARGIN_X, MARGIN_Y);
+            lv_obj_set_size(s_log_box, LCD_W - 2 * MARGIN_X, LCD_H - 2 * MARGIN_Y - 22);
+            lv_obj_set_style_radius(s_log_box, 0, 0);
+            lv_obj_set_style_border_width(s_log_box, 0, 0);
+            lv_obj_set_style_bg_opa(s_log_box, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_pad_all(s_log_box, 0, 0);
+            lv_obj_set_flex_flow(s_log_box, LV_FLEX_FLOW_COLUMN);
+            lv_obj_set_scroll_dir(s_log_box, LV_DIR_VER);
+            lv_obj_set_scrollbar_mode(s_log_box, LV_SCROLLBAR_MODE_OFF);
+            // 快照渲染：进入时一次性取 16 条拼进临时缓冲（堆），页内不再读环形缓冲。
+            // 单 label + set_text_static（零拷贝）：合并成一个对象只花 ~200 B。
+            // 堆申请失败就只显示提示——诊断页是锦上添花，绝不能拖垮业务。
+            s_log_text = (char *)pvPortMalloc(LOG_TEXT_CAP);
+            size_t off = 0;
+            if (s_log_text != NULL) {
+                char buf[LOG_RING_LEN];
+                for (int i = 0; i < LOG_RING_N; i++) { // 0=最新，从上往下依次变旧
+                    log_ring_tail(i, buf, sizeof buf);
+                    if (buf[0] == '\0') {
+                        continue; // 开机早期没写满时跳过空条
+                    }
+                    int w = snprintf(s_log_text + off, LOG_TEXT_CAP - off,
+                                     off == 0 ? "%s" : "\n-----\n%s", buf);
+                    if (w < 0 || (size_t)w >= LOG_TEXT_CAP - off) {
+                        break; // 缓冲写满即止（理论上到不了：条目长度与缓冲同规模）
+                    }
+                    off += (size_t)w;
+                }
+                if (off == 0) {
+                    snprintf(s_log_text, LOG_TEXT_CAP, "--");
+                }
+            }
+            s_log_label = lv_label_create(s_log_box);
+            lv_obj_set_size(s_log_label, LV_PCT(100), LV_SIZE_CONTENT);
+            lv_label_set_long_mode(s_log_label, LV_LABEL_LONG_WRAP);
+            lv_obj_set_style_text_font(s_log_label, &key_font_14, 0);
+            lv_obj_set_style_text_color(s_log_label, lv_color_hex(C_INK), 0);
+            lv_obj_set_style_text_align(s_log_label, LV_TEXT_ALIGN_LEFT, 0);
+            lv_obj_set_style_pad_ver(s_log_label, 2, 0);
+            lv_label_set_text_static(s_log_label,
+                                     s_log_text != NULL ? s_log_text : "内存不足，无法显示");
             s_log_idx = add_label(parent, MARGIN_X, LCD_H - MARGIN_Y - 18,
-                                  LCD_W - 2 * MARGIN_X, 18, &key_font_14, C_DIM, "");
+                                  LCD_W - 2 * MARGIN_X, 18, &key_font_14, C_DIM,
+                                  "右一上 右二下 右三返回");
             set_home_visible(false);
             set_onb_visible(false);
             set_visible(s_diag_a, false);
             set_visible(s_diag_b, false);
             s_home_shown = false;
             s_fb_shown = false;
+            s_onb_shown = false;
         } else {
-            lv_obj_del(s_log_full);
+            lv_obj_del(s_log_box); // 子 label 一并删除（label 是 set_text_static，先删对象再放堆）
+            s_log_box = NULL;
+            s_log_label = NULL;
             lv_obj_del(s_log_idx);
-            s_log_full = NULL;
             s_log_idx = NULL;
+            if (s_log_text != NULL) {
+                vPortFree(s_log_text); // 退页立刻归还 2.2KB，BLE 运行期堆不留负债
+                s_log_text = NULL;
+            }
         }
     }
     if (logpage) {
-        char buf[LOG_RING_LEN];
-        log_ring_tail(s_log_view_idx, buf, sizeof buf);
-        set_text(s_log_full, buf[0] != '\0' ? buf : "--");
-        char pos[16];
-        snprintf(pos, sizeof pos, "%d/%d", s_log_view_idx + 1, LOG_RING_N);
-        set_text(s_log_idx, pos);
+        // 页内只处理滚动，内容保持进入时的快照不动
+        int dir = s_log_scroll_dir;
+        if (dir != 0) {
+            s_log_scroll_dir = 0;
+            lv_obj_scroll_by(s_log_box, 0, dir * 48, LV_ANIM_OFF); // 一步约 3 行
+        }
         return;
     }
 
@@ -554,11 +634,14 @@ static void ui_tick(lv_timer_t *timer)
     //   "启="是上次重启原因：崩溃/看门狗/掉电 = 出过事，上电/软件 = 正常。
     //   单击右三进入全屏日志页逐条看报错。
     if (s_diag) {
-        if (s_home_shown || s_fb_shown) {
+        // 之前漏了 s_onb_shown：引导页占屏时进诊断，home/fb 都是 false →
+        // 引导页不会被隐藏，诊断文字直接叠在引导页上（实机「严重遮挡」根因）。
+        if (s_home_shown || s_fb_shown || s_onb_shown) {
             set_home_visible(false);
             set_onb_visible(false);
             s_home_shown = false;
             s_fb_shown = false;
+            s_onb_shown = false;
         }
         char a[LOG_RING_LEN], b[LOG_RING_LEN];
         app_button_try_reinit(); // 初始化失败时界面心跳顺带驱动 5 秒自愈重试
@@ -814,17 +897,33 @@ esp_err_t key_ui_start(void)
     s_onb_step = add_label(scr, MARGIN_X, 40, LCD_W - 2 * MARGIN_X, 54, &key_font_14, C_DIM,
                            ONB_STEP_DEFAULT);
     lv_obj_set_style_text_align(s_onb_step, LV_TEXT_ALIGN_LEFT, 0);
+    // 失败时步骤区要整段显示绑定失败原因（运行时任意文本），必须自动换行
+    lv_label_set_long_mode(s_onb_step, LV_LABEL_LONG_WRAP);
     s_onb_vin = add_label(scr, MARGIN_X, 97, LCD_W - 2 * MARGIN_X, 16, &key_font_14, C_INK, "");
     s_onb_status = add_label(scr, MARGIN_X, 117, LCD_W - 2 * MARGIN_X, 18, &key_font_14, C_INK, "");
     // 列表卡片：圆角边框容器，纵向 flex，每行是横向 flex
     s_onb_panel = lv_obj_create(scr);
-    lv_obj_set_pos(s_onb_panel, MARGIN_X - 2, 142);
-    lv_obj_set_size(s_onb_panel, LCD_W - 2 * MARGIN_X + 4, 116);
+    // 卡片下移并加高 12px：配网阶段二维码上下各留 6px 呼吸位，状态行与底部
+    // 按键提示的间距也均衡（列表阶段 5 行 ×20px 仍放得下）
+    lv_obj_set_pos(s_onb_panel, MARGIN_X - 2, 150);
+    lv_obj_set_size(s_onb_panel, LCD_W - 2 * MARGIN_X + 4, 128);
     lv_obj_set_style_bg_color(s_onb_panel, lv_color_hex(C_CARD_BG), 0);
     lv_obj_set_style_bg_opa(s_onb_panel, LV_OPA_COVER, 0);
     lv_obj_set_style_border_color(s_onb_panel, lv_color_hex(C_LINE), 0);
     lv_obj_set_style_border_width(s_onb_panel, 1, 0);
     lv_obj_set_style_radius(s_onb_panel, 10, 0);
+    // 配网二维码：多数手机连热点会自动弹配置页（captive portal），不弹的手机
+    // 用相机扫这个码直达 http://192.168.4.2。只在 NOVIN 阶段显示（onb_render
+    // 按阶段切换），位置占用列表卡片区域（该阶段列表本来就让位给指引）。
+    s_onb_qr = lv_qrcode_create(scr);
+    lv_qrcode_set_size(s_onb_qr, 116);
+    lv_obj_set_pos(s_onb_qr, (LCD_W - 116) / 2, 156);
+    {
+        const char *qr_url = "http://" VIN_AP_IP;
+        if (!lv_qrcode_update(s_onb_qr, qr_url, strlen(qr_url))) {
+            ESP_LOGE(TAG, "配网二维码生成失败");
+        }
+    }
     lv_obj_set_style_pad_all(s_onb_panel, 6, 0);
     lv_obj_remove_flag(s_onb_panel, LV_OBJ_FLAG_SCROLLABLE);
     for (int i = 0; i < TLB_ONB_LIST_MAX; i++) {

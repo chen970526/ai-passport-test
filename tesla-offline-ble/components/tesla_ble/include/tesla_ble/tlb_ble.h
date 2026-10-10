@@ -181,6 +181,7 @@ typedef enum {
     TLB_ONB_DONE,        // 绑定成功（停留约 2 秒后自动回首页）
     TLB_ONB_FAIL,        // 连接/绑定失败（onb_note 带原因，可重选/重扫）
     TLB_ONB_NOVIN,       // 设备里没有 VIN：热点配网页引导（见 vin_cfg.c），存好 VIN 自动离开
+    TLB_ONB_RESCAN_ASK   // 重新搜索确认弹窗（右一长按触发；右三=执行，右一/右二=取消）
 } tlb_onb_stage_t;
 
 typedef struct {
@@ -230,6 +231,8 @@ typedef enum {
     TLB_CMD_FORGET,        // 清除本机密钥 / 会话 / 档案
     TLB_CMD_ONB_SELECT,    // 引导模式：连接光标所指车辆并自动发起绑定
     TLB_CMD_ONB_RESCAN,    // 引导模式：立刻重扫一轮
+    TLB_CMD_ONB_RESCAN_ASK,    // 引导模式：右一长按 → 弹「重新搜索?」确认框
+    TLB_CMD_ONB_RESCAN_CANCEL, // 确认框内右一/右二 → 取消，恢复原阶段
     TLB_CMD_FACTORY_RESET  // 组合键出厂重置：清密钥/会话/档案/VIN 后重启进引导
 } tlb_cmd_t;
 
@@ -238,6 +241,7 @@ void tlb_app_post(tlb_cmd_t cmd, int32_t arg);
 void tlb_app_post_vin(const char *vin);
 // 首次绑定引导：模式开关查询（app_main 按键分流用）与列表光标移动（任意任务可调）。
 bool tlb_app_onboarding(void);
+bool tlb_app_onb_rescan_pending(void); // 重扫确认弹窗在屏（按键任务可调，只读快照）
 void tlb_app_onb_move(int delta);
 // 引导页右三单击（按键任务直调，不走命令队列）：PAIRING 中 worker 正阻塞在绑定
 // 循环里，队列命令无人出列——必须像 onb_move 一样直接置标志，由绑定循环消费。

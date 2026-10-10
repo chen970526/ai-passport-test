@@ -147,6 +147,12 @@ static tlb_onb_item_t s_onb_items[TLB_APP_ADV_MAX]; // 排序后的全量条目�
                                                  // 按键任务只动 s_onb_cursor 这个 int）
 static int s_onb_raw_idx[TLB_APP_ADV_MAX];       // 条目 m ← 原始记录 s_onb_raw[idx[m]]
 static int s_onb_n;                              // 条目总数（一屏装不下靠翻页）
+// 重扫确认弹窗（右一长按，防误触）：worker 单任务读写，无需加锁；
+// 取消时按 s_ask_prev/s_ask_prev_note 恢复原阶段（FAIL 的失败原因不能丢——
+// onb_publish 传 NULL 会把快照 note 清空）。
+static bool s_rescan_ask;
+static uint8_t s_ask_prev;
+static char s_ask_prev_note[TLB_ONB_NOTE_MAX];
 
 // core 调用的结果对象：worker 串行使用，静态分配防栈溢出
 static tlb_handshake_result_t s_hr;
@@ -542,11 +548,10 @@ static void load_profile(void)
     if (s_vin[0]) {
         sb_puts(&sb, "，本机记录的 VIN=");
         sb_puts(&sb, s_vin);
-        sb_puts(&sb, "；");
+        sb_puts(&sb, "；在引导页选车即可绑定");
     } else {
-        sb_puts(&sb, "，本机还没有 VIN；");
+        sb_puts(&sb, "，本机还没有 VIN；连热点 AI-PASSPORT-TSL，在配网页输入 VIN");
     }
-    sb_puts(&sb, "先 scan 列出车辆，再 connect <VIN> 连一次");
     sb_log(TLB_LOG_INFO, &sb);
 }
 
@@ -1179,6 +1184,7 @@ static int onb_rank(const tlb_ble_dev_t *d)
 
 static void handle_onb_rescan(void)
 {
+    s_rescan_ask = false; // 任何重扫入口（弹窗确认/右三双击/自动重扫）都顺手收掉弹窗
     if (!s_onb_active) {
         return;
     }
@@ -1252,6 +1258,38 @@ static void handle_onb_rescan(void)
     tlb_app_post(TLB_CMD_ONB_RESCAN, 0); // worker 出列再排下一轮，选车命令能插进来
 }
 
+// 右一长按：只在「列表就绪/失败」两阶段弹确认框（SCAN 无意义、CONNECTING/PAIRING
+// 会被 onb_busy 拦住）。原 stage 和 note 先抄一份，取消时原样恢复。
+static void handle_onb_rescan_ask(void)
+{
+    if (!s_onb_active || s_rescan_ask) {
+        return;
+    }
+    uint8_t st = onb_stage();
+    if (st != TLB_ONB_LIST && st != TLB_ONB_FAIL) {
+        return;
+    }
+    portENTER_CRITICAL(&s_onb_mux);
+    s_ask_prev = st;
+    memcpy(s_ask_prev_note, s_onb_pub.note, sizeof(s_ask_prev_note));
+    portEXIT_CRITICAL(&s_onb_mux);
+    s_rescan_ask = true;
+    onb_publish(TLB_ONB_RESCAN_ASK, NULL);
+}
+
+// 弹窗内右一/右二 = 取消：回到弹窗前的阶段，FAIL 要连失败原因一起带回。
+static void handle_onb_rescan_cancel(void)
+{
+    if (!s_rescan_ask) {
+        return;
+    }
+    s_rescan_ask = false;
+    if (!s_onb_active || onb_stage() != TLB_ONB_RESCAN_ASK) {
+        return; // 弹窗期间状态已被别的路径切走（如绑定完成），不越权恢复
+    }
+    onb_publish(s_ask_prev, s_ask_prev_note);
+}
+
 // 从广播名提取 VIN 后 6 位（实测：新固件车广播名固定 "Tesla " + VIN 后 6 位）
 static bool onb_vin6_of(const char *name, char *out6)
 {
@@ -1322,7 +1360,6 @@ static void handle_onb_select(void)
         onb_publish(TLB_ONB_FAIL, "无VIN：先连接入点配置");
         return;
     }
-
     // 还没连上车（首次选择/上次连接失败）才发起连接；绑定失败重选时车还连着，
     // 直接重发加钥匙请求，不做无谓的断连重连。
     if (!tlb_ble_connected()) {
@@ -1358,13 +1395,20 @@ static void handle_onb_select(void)
         s_onb_active = false;
         return;
     }
-    // 失败原因只取第一行（绑定结果文本可能多行，屏幕一行放不下）
+    // 失败原因只取第一行（绑定结果文本可能多行，屏幕一行放不下）。
+    // 窗口耗尽（既没终态也建不起会话）单独给一句人话：车机始终没确认——
+    // 最可能是没弹「添加钥匙」、没贴 NFC 卡、蓝牙槽被官方 App 占满或车睡了；
+    // 完整逐项排查清单打在串口日志里（s_br.text 原文不精简）。
     char why[TLB_ONB_NOTE_MAX];
-    snprintf(why, sizeof(why), "%.63s", s_br.text);
-    for (char *p = why; *p != '\0'; p++) {
-        if (*p == '\n') {
-            *p = '\0';
-            break;
+    if (!s_br.ok && s_br.wait) {
+        snprintf(why, sizeof(why), "等150秒车未确认：没弹窗或没贴卡");
+    } else {
+        snprintf(why, sizeof(why), "%.63s", s_br.text);
+        for (char *p = why; *p != '\0'; p++) {
+            if (*p == '\n') {
+                *p = '\0';
+                break;
+            }
         }
     }
     onb_publish(TLB_ONB_FAIL, why[0] != '\0' ? why : "绑定未完成，请靠近车辆重试");
@@ -1663,6 +1707,12 @@ static void handle_cmd(const cmd_msg_t *m)
     case TLB_CMD_ONB_RESCAN:
         handle_onb_rescan();
         break;
+    case TLB_CMD_ONB_RESCAN_ASK:
+        handle_onb_rescan_ask();
+        break;
+    case TLB_CMD_ONB_RESCAN_CANCEL:
+        handle_onb_rescan_cancel();
+        break;
     case TLB_CMD_FACTORY_RESET:
         handle_factory_reset();
         break;
@@ -1728,6 +1778,12 @@ void tlb_app_post_vin(const char *vin)
 }
 
 bool tlb_app_onboarding(void) { return s_onb_active; }
+
+// 重扫确认弹窗是否挂在屏幕上（按键任务用：弹窗期间右一/右二/右三改走确认与取消）
+bool tlb_app_onb_rescan_pending(void)
+{
+    return s_onb_active && onb_stage() == TLB_ONB_RESCAN_ASK;
+}
 
 // 引导页右三单击：PAIRING 中直接置「我已确认」标志（按键任务上下文，只动一个
 // volatile bool，与 onb_move 同款做法）；其余阶段照常入队走选车流程。

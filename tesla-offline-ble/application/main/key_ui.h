@@ -22,6 +22,14 @@ void key_ui_toggle_diag(void);
 // 诊断模式内翻页（右三单击触发）：页1 电压 ↔ 页2 日志。非诊断模式下无操作。
 void key_ui_diag_next_page(void);
 
+// 日志页（页2）滚动（右一/右二单击触发）：dir=-1 上移、+1 下移，一次约 3 行。
+// 页2 是 16 条日志合并的一屏（横线分隔），拍照时滚到想拍的位置即可。
+// 只写 volatile 标志，可从 button 任务调用；非页2 时无操作。
+void key_ui_diag_scroll(int dir);
+
+// 当前诊断页码：0=页1 电压页，1=页2 日志页。app_main 按键分流用。
+int key_ui_diag_page(void);
+
 // 当前是否处于屏幕诊断模式（app_main 用它区分右三单击「翻页」还是「开前备箱」）。
 bool key_ui_in_diag(void);
 
